@@ -159,6 +159,14 @@ struct App {
     Layout layout = Layout::None; // --sbs / --tb
     Packing packing = Packing::Auto; // --sbs=half|full, --tb=half|full
     bool swap_eyes = false; // --swap-eyes
+    // Alignment of the two eyes' pictures, in degrees (stereo layouts only).
+    // halign > 0 moves the pictures apart (left one left, right one right, by
+    // half each), so the scene looks farther away; < 0 moves them together.
+    // valign > 0 raises the right eye's picture and lowers the left's (half
+    // each); < 0 does the opposite. Applied per display eye, whatever
+    // --swap-eyes says about which half of the file goes where.
+    double halign_deg = 0.0; // --halignment
+    double valign_deg = 0.0; // --valignment
     double hfov_deg = 180.0; // --hfov (VR only)
     double vfov_deg = 0.0;   // --vfov (VR only); 0 = derive from the picture
     // Aspect ratio (w/h) of ONE eye's picture. Set by --aspect, otherwise
@@ -379,6 +387,24 @@ static XrSwapchainSubImage eye_sub_image(const App &app, int eye)
         break;
     }
     return s;
+}
+
+// Orientation that turns a layer's picture by a small angle: yaw (positive
+// moves the picture to the LEFT) then pitch (positive moves it UP). Used by
+// --vr, where the sphere has infinite radius so sliding a layer sideways would
+// do nothing; rotating it gives the same visual shift.
+static XrQuaternionf alignment_orientation(double yaw_deg, double pitch_deg)
+{
+    const double d2r = M_PI / 180.0;
+    const double sy = std::sin(yaw_deg * d2r * 0.5), cy = std::cos(yaw_deg * d2r * 0.5);
+    const double sx = std::sin(pitch_deg * d2r * 0.5), cx = std::cos(pitch_deg * d2r * 0.5);
+    // yaw (about +Y) * pitch (about +X)
+    XrQuaternionf q;
+    q.x = (float)(cy * sx);
+    q.y = (float)(sy * cx);
+    q.z = (float)(-sy * sx);
+    q.w = (float)(cy * cx);
+    return q;
 }
 
 static void end_frame_empty(App &app, XrTime displayTime)
@@ -603,6 +629,12 @@ static void frame_loop(App &app)
                                   : XR_EYE_VISIBILITY_RIGHT);
             const XrSwapchainSubImage sub = eye_sub_image(app, (int)i);
 
+            // Alignment: each eye's picture moves by half of the setting, the
+            // left eye one way and the right eye the other.
+            const double side = stereo ? (i == 0 ? -0.5 : 0.5) : 0.0;
+            const double shift_right_deg = side * app.halign_deg;
+            const double shift_up_deg = side * app.valign_deg;
+
             if (app.vr) {
                 // Equirect2: the compositor maps the picture onto a section
                 // of a sphere centred on the viewer. The picture's centre
@@ -613,7 +645,8 @@ static void frame_loop(App &app)
                 e.space = app.localSpace;
                 e.eyeVisibility = vis;
                 e.subImage = sub;
-                e.pose.orientation = { 0, 0, 0, 1 };
+                e.pose.orientation =
+                    alignment_orientation(-shift_right_deg, shift_up_deg);
                 e.pose.position = { 0, 0, 0 };
                 e.radius = VR_SPHERE_RADIUS;
                 e.centralHorizontalAngle = (float)(app.hfov_deg * M_PI / 180.0);
@@ -625,7 +658,14 @@ static void frame_loop(App &app)
                 q.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
                 q.space = app.viewSpace;
                 q.pose.orientation = { 0, 0, 0, 1 };
-                q.pose.position = { 0, 0, 0 }; // at viewSpace origin (4 m ahead)
+                // At the viewSpace origin (4 m ahead), slid sideways/up so
+                // the picture shifts by the alignment angle as seen from the
+                // head (QUAD_Z is negative, hence the minus).
+                const double d2r = M_PI / 180.0;
+                q.pose.position = {
+                    (float)(-QUAD_Z * std::tan(shift_right_deg * d2r)),
+                    (float)(-QUAD_Z * std::tan(shift_up_deg * d2r)),
+                    0.0f };
                 q.size = { QUAD_WIDTH, quad_h };
                 q.eyeVisibility = vis;
                 q.subImage = sub;
@@ -746,6 +786,12 @@ static void print_usage()
         "                      full = each eye unsqueezed. Without =half/=full:\n"
         "                      guessed from the frame shape in --flat, full in --vr\n"
         "  --swap-eyes         the file has the right eye first\n"
+        "  --halignment=<deg>  horizontal alignment of the two pictures, -20..20.\n"
+        "                      positive moves them apart (scene looks farther\n"
+        "                      away), negative moves them together. Try 0.1-1\n"
+        "  --valignment=<deg>  vertical alignment, -20..20. positive raises the\n"
+        "                      right picture and lowers the left, negative the\n"
+        "                      reverse\n"
         "  --aspect=<x.xx>     aspect ratio (w/h) of ONE eye's picture; overrides\n"
         "                      the value worked out from the video\n"
         "\n"
@@ -793,6 +839,10 @@ int main(int argc, char **argv)
             have_vfov = true;
         } else if ((v = flag_value(argc, argv, i, "--aspect"))) {
             app.eye_aspect = parse_number(v, "--aspect", 0.05, 20.0);
+        } else if ((v = flag_value(argc, argv, i, "--halignment"))) {
+            app.halign_deg = parse_number(v, "--halignment", -20.0, 20.0);
+        } else if ((v = flag_value(argc, argv, i, "--valignment"))) {
+            app.valign_deg = parse_number(v, "--valignment", -20.0, 20.0);
         } else if ((v = flag_value(argc, argv, i, "--hwdec"))) {
             app.hwdec = v;
         } else if (std::strncmp(argv[i], "--", 2) == 0) {
@@ -821,6 +871,10 @@ int main(int argc, char **argv)
     if (app.swap_eyes && app.layout == Layout::None)
         fprintf(stderr, "mpv-vr: warning: --swap-eyes has no effect without "
                         "--sbs or --tb\n");
+    if ((app.halign_deg != 0 || app.valign_deg != 0) &&
+        app.layout == Layout::None)
+        fprintf(stderr, "mpv-vr: warning: --halignment/--valignment have no "
+                        "effect without --sbs or --tb\n");
     if (!app.solid && video == nullptr) {
         print_usage();
         return 1;
@@ -837,6 +891,9 @@ int main(int argc, char **argv)
     if (app.eye_aspect > 0)
         fprintf(stderr, "mpv-vr: per-eye aspect set by --aspect: %.3f\n",
                 app.eye_aspect);
+    if (app.halign_deg != 0 || app.valign_deg != 0)
+        fprintf(stderr, "mpv-vr: eye alignment: horizontal %.3f deg, vertical "
+                        "%.3f deg\n", app.halign_deg, app.valign_deg);
 
     // Wayland first: the EGL display is built off this wl_display.
     app.wl = wl_display_connect(nullptr);
