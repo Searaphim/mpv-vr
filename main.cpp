@@ -41,6 +41,7 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget,
                             GLuint texture, GLint level);
 GLboolean glIsTexture(GLuint texture);
 GLenum glGetError(void);
+const GLubyte *glGetStringi(GLenum name, GLuint index);
 }
 
 #include <mpv/client.h>
@@ -61,18 +62,24 @@ GLenum glGetError(void);
 #ifndef GL_SRGB8_ALPHA8
 #define GL_SRGB8_ALPHA8 0x8C43
 #endif
+#ifndef GL_NUM_EXTENSIONS
+#define GL_NUM_EXTENSIONS 0x821D
+#endif
+#ifndef GL_OUT_OF_MEMORY
+#define GL_OUT_OF_MEMORY 0x0505
+#endif
 
 #define QUAD_Z (-4.0f)      // flat screen sits this far in front of the head
 #define QUAD_WIDTH (2.0f)   // flat screen width in metres
 
-// VR swapchain sizing. The runtime's recommended per-eye size is meant for
-// the headset's own field of view, so a 360-degree picture squeezed into it
-// would be very soft. We scale the per-eye size with the angle covered,
-// assuming the recommended size spans roughly VR_HEADSET_FOV_DEG degrees, and
-// cap it at MAX_VR_EYE_DIM pixels (a SBS/TB pair is then at most twice that,
-// which stays within the usual 16384 GL texture limit).
-#define VR_HEADSET_FOV_DEG 100.0
-#define MAX_VR_EYE_DIM 8192.0
+// Swapchain sizing is measured at runtime (see create_swapchain): the headset's
+// pixel density from its reported field of view, the video's own resolution,
+// the GL texture limits, the free GPU memory, and a retry loop in case the
+// runtime still refuses the size. Only two policy constants are left:
+// how much of the currently free GPU memory the swapchain may use (the rest is
+// for mpv's decoded frames and scaling), and how much smaller each retry is.
+#define SWAPCHAIN_VRAM_SHARE 0.5
+#define SWAPCHAIN_SHRINK_STEP 0.75
 
 // Equirect layer radius. Zero means an infinitely distant sphere, which is
 // what you want for VR video: only the viewing direction matters, so there is
@@ -132,6 +139,8 @@ struct App {
     // GL internal format of the swapchain textures (e.g. GL_RGBA8). Passed to
     // mpv as the FBO's internal_format so it doesn't have to guess.
     int64_t format = 0;
+    // The runtime's recommended per-eye size (the floor for our own sizing).
+    uint32_t rec_w = 0, rec_h = 0;
     std::vector<XrSwapchain> swapchains;
     // Concrete type (24 B), not the 16 B base header: the runtime writes the
     // full XrSwapchainImageOpenGLKHR per element, so the buffer must match.
@@ -268,8 +277,12 @@ static void poll_events(App &app)
     }
 }
 
-static void create_fbos(App &app)
+// Wrap each swapchain image in an FBO. Returns false if any FBO is incomplete
+// or the GL driver ran out of memory allocating the images, so the caller can
+// retry with a smaller swapchain.
+static bool create_fbos(App &app)
 {
+    bool all_ok = true;
     for (size_t i = 0; i < app.swapchains.size(); i++) {
         uint32_t n = 0;
         xrEnumerateSwapchainImages(app.swapchains[i], 0, &n, nullptr);
@@ -299,9 +312,258 @@ static void create_fbos(App &app)
                         "mpv-vr: FBO %zu/%u tex=%u isTexture=%d glErr=0x%x status=0x%x\n",
                         i, j, (unsigned)tex, (int)isTex, (unsigned)glErr,
                         (unsigned)status);
+            if (status != GL_FRAMEBUFFER_COMPLETE || glErr == GL_OUT_OF_MEMORY)
+                all_ok = false;
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             app.fbos[i][j] = fbo;
         }
+    }
+    return all_ok;
+}
+
+// ---- Swapchain sizing: everything below is measured, not assumed ----
+
+// Query a GL integer; 0 if the driver doesn't support the query.
+static GLint gl_get_int(GLenum pname)
+{
+    GLint v = 0;
+    while (glGetError() != GL_NO_ERROR) {}
+    glGetIntegerv(pname, &v);
+    if (glGetError() != GL_NO_ERROR)
+        return 0;
+    return v;
+}
+
+static bool gl_has_extension(const char *name)
+{
+    const GLint n = gl_get_int(GL_NUM_EXTENSIONS);
+    for (GLint i = 0; i < n; i++) {
+        const GLubyte *e = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        if (e && std::strcmp(reinterpret_cast<const char *>(e), name) == 0)
+            return true;
+    }
+    return false;
+}
+
+// Free GPU memory in bytes right now, or 0 if the driver can't tell us
+// (NVIDIA and AMD can; the swapchain then relies on the retry loop alone).
+static uint64_t gl_free_vram_bytes()
+{
+    if (gl_has_extension("GL_NVX_gpu_memory_info")) {
+        // GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, in KiB
+        const GLint kib = gl_get_int(0x9049);
+        if (kib > 0)
+            return (uint64_t)kib * 1024;
+    }
+    if (gl_has_extension("GL_ATI_meminfo")) {
+        // TEXTURE_FREE_MEMORY_ATI: four values, the first is the free pool in KiB
+        GLint v[4] = { 0, 0, 0, 0 };
+        while (glGetError() != GL_NO_ERROR) {}
+        glGetIntegerv(0x87FC, v);
+        if (glGetError() == GL_NO_ERROR && v[0] > 0)
+            return (uint64_t)v[0] * 1024;
+    }
+    return 0;
+}
+
+// Largest width/height we can render into: the smaller of the GL texture and
+// viewport limits. 0 if the driver reports neither.
+static uint32_t gl_max_dim()
+{
+    GLint dim = gl_get_int(GL_MAX_TEXTURE_SIZE);
+    GLint vp[2] = { 0, 0 };
+    while (glGetError() != GL_NO_ERROR) {}
+    glGetIntegerv(GL_MAX_VIEWPORT_DIMS, vp);
+    if (glGetError() == GL_NO_ERROR) {
+        for (int i = 0; i < 2; i++)
+            if (vp[i] > 0 && (dim <= 0 || vp[i] < dim))
+                dim = vp[i];
+    }
+    return dim > 0 ? (uint32_t)dim : 0;
+}
+
+// Pixels per degree at the CENTRE of the view that the runtime's recommended
+// per-eye size delivers, from the field of view xrLocateViews reports. A
+// perspective image has f = size / (tan(right) - tan(left)) pixels per unit
+// tangent, and at the centre one unit of tangent is one radian. (The average
+// over the whole view would overstate it: pixels per degree grow towards the
+// edges of a perspective image, and that is not where you look.)
+static void headset_pixel_density(const std::vector<XrView> &views,
+                                  uint32_t rec_w, uint32_t rec_h,
+                                  double &ppd_x, double &ppd_y)
+{
+    ppd_x = ppd_y = 0;
+    for (const XrView &v : views) {
+        const double tx = std::tan(v.fov.angleRight) - std::tan(v.fov.angleLeft);
+        const double ty = std::tan(v.fov.angleUp) - std::tan(v.fov.angleDown);
+        if (std::isfinite(tx) && std::isfinite(ty) && tx > 0 && ty > 0) {
+            ppd_x = std::max(ppd_x, rec_w / tx * M_PI / 180.0);
+            ppd_y = std::max(ppd_y, rec_h / ty * M_PI / 180.0);
+        }
+    }
+}
+
+// Vertical coverage of the VR picture: --vfov, or derived from hfov and the
+// per-eye aspect (at most 180).
+static double vr_vfov(const App &app)
+{
+    if (app.vfov_deg > 0)
+        return app.vfov_deg;
+    if (app.eye_aspect <= 0)
+        return std::min(app.hfov_deg, 180.0);
+    return std::min(180.0, app.hfov_deg / app.eye_aspect);
+}
+
+static bool read_video_size(App &app, int64_t &w, int64_t &h)
+{
+    w = h = 0;
+    if (!app.mpv)
+        return false;
+    return mpv_get_property(app.mpv, "width", MPV_FORMAT_INT64, &w) >= 0 &&
+           mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &h) >= 0 &&
+           w > 0 && h > 0;
+}
+
+static void destroy_swapchain(App &app)
+{
+    for (auto &fbos : app.fbos) {
+        for (auto fbo : fbos)
+            glDeleteFramebuffers(1, &fbo);
+        fbos.clear();
+    }
+    for (auto s : app.swapchains)
+        xrDestroySwapchain(s);
+    app.swapchains.clear();
+    app.images.clear();
+    app.fbos.clear();
+}
+
+// Create the one swapchain that holds everything (both eyes packed like the
+// video, or a single picture for plain 2D); the layers pick out the part for
+// each eye. Done lazily from the frame loop because the headset's field of
+// view (xrLocateViews) and the video's size are only known once the session
+// is running and the video has loaded.
+//
+// Per-eye size, starting from the runtime's recommendation (the floor):
+//   flat: the recommendation. The screen covers only a fraction of the view,
+//         so it is already more than the panel can show of it.
+//   --vr: enough texels to match the headset's pixel density across the angle
+//         the picture covers (times the zoom), but never more than the video
+//         has pixels, and never more than the GL limits allow.
+// Then the size is verified and, if needed, shrunk step by step until the
+// runtime accepts it, the FBOs are complete, and (where the driver reports
+// free GPU memory) the images fit in our share of it.
+static void create_swapchain(App &app, const std::vector<XrView> &views,
+                             int64_t src_w, int64_t src_h)
+{
+    const bool sbs = app.layout == Layout::SideBySide;
+    const bool tb = app.layout == Layout::TopBottom;
+    const uint32_t px = sbs ? 2 : 1; // pictures across
+    const uint32_t py = tb ? 2 : 1;  // pictures down
+
+    uint32_t eye_w = app.rec_w, eye_h = app.rec_h;
+    double ppd_x = 0, ppd_y = 0;
+    if (app.vr) {
+        headset_pixel_density(views, app.rec_w, app.rec_h, ppd_x, ppd_y);
+        if (ppd_x > 0 && ppd_y > 0) {
+            // The zoom enlarges the picture without adding pixels, so the
+            // texture grows with it to keep the visible part as sharp.
+            double want_w = ppd_x * app.hfov_deg * app.zoom;
+            double want_h = ppd_y * vr_vfov(app) * app.zoom;
+            // Texels beyond the video's own pixels add nothing.
+            if (src_w > 0 && src_h > 0) {
+                want_w = std::min(want_w, (double)(sbs ? src_w / 2 : src_w));
+                want_h = std::min(want_h, (double)(tb ? src_h / 2 : src_h));
+            }
+            eye_w = std::max<uint32_t>(app.rec_w, (uint32_t)want_w);
+            eye_h = std::max<uint32_t>(app.rec_h, (uint32_t)want_h);
+        }
+    }
+
+    const uint32_t max_dim = gl_max_dim();
+    if (max_dim) {
+        eye_w = std::min(eye_w, max_dim / px);
+        eye_h = std::min(eye_h, max_dim / py);
+    }
+
+    const uint64_t free_vram = gl_free_vram_bytes();
+    const uint64_t budget = (uint64_t)((double)free_vram * SWAPCHAIN_VRAM_SHARE);
+    // Bytes per pixel of the swapchain format (RGBA8 / sRGB8_A8 = 4; assume
+    // the worst, a 16-bit float format, for anything else).
+    const uint32_t bpp =
+        (app.format == (int64_t)GL_RGBA8 || app.format == (int64_t)GL_SRGB8_ALPHA8) ? 4 : 8;
+
+    for (;;) {
+        uint32_t w = (eye_w * px) & ~1u; // even, so the halves split exactly
+        uint32_t h = (eye_h * py) & ~1u;
+        const bool at_floor = eye_w <= app.rec_w && eye_h <= app.rec_h;
+
+        // Drain stale GL errors so the ones checked below come from the
+        // allocation inside xrCreateSwapchain.
+        while (glGetError() != GL_NO_ERROR) {}
+
+        XrSwapchainCreateInfo c = {};
+        c.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+        c.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        c.format = app.format;
+        c.sampleCount = 1;
+        c.width = w;
+        c.height = h;
+        c.faceCount = 1;
+        c.arraySize = 1;
+        c.mipCount = 1;
+        XrSwapchain sc = XR_NULL_HANDLE;
+        const XrResult r = xrCreateSwapchain(app.session, &c, &sc);
+
+        bool ok = (r == XR_SUCCESS);
+        if (!ok) {
+            fprintf(stderr, "mpv-vr: swapchain %ux%u refused by the runtime "
+                            "(XrResult %d)\n", w, h, (int)r);
+        } else {
+            app.swapchains.assign(1, sc);
+            app.width = w;
+            app.height = h;
+            app.images.assign(1, {});
+            app.fbos.assign(1, {});
+            ok = create_fbos(app);
+            if (!ok)
+                fprintf(stderr, "mpv-vr: swapchain %ux%u could not be "
+                                "allocated (incomplete FBO or GL out of memory)\n",
+                        w, h);
+            const uint64_t need =
+                (uint64_t)w * h * bpp * (uint64_t)app.fbos[0].size();
+            if (ok && budget && need > budget && !at_floor) {
+                fprintf(stderr, "mpv-vr: swapchain %ux%u needs %.0f MB, over "
+                                "our %.0f MB share of free GPU memory\n",
+                        w, h, need / 1048576.0, budget / 1048576.0);
+                ok = false;
+            }
+            if (!ok)
+                destroy_swapchain(app);
+        }
+        if (ok)
+            break;
+
+        if (at_floor)
+            die("could not create a swapchain even at the runtime's "
+                "recommended size %ux%u", app.rec_w, app.rec_h);
+        eye_w = std::max(app.rec_w, (uint32_t)(eye_w * SWAPCHAIN_SHRINK_STEP));
+        eye_h = std::max(app.rec_h, (uint32_t)(eye_h * SWAPCHAIN_SHRINK_STEP));
+    }
+
+    fprintf(stderr, "mpv-vr: swapchain %ux%u, %zu image(s), %.0f MB each "
+                    "(runtime recommends %ux%u per eye)\n",
+            app.width, app.height, app.fbos[0].size(),
+            (double)app.width * app.height * bpp / 1048576.0, app.rec_w,
+            app.rec_h);
+    if (app.vr) {
+        fprintf(stderr, "mpv-vr: sizing inputs: headset %.1f x %.1f px/deg at "
+                        "the centre, video %lldx%lld, GL max %u, ",
+                ppd_x, ppd_y, (long long)src_w, (long long)src_h, max_dim);
+        if (free_vram)
+            fprintf(stderr, "free GPU memory %.0f MB\n", free_vram / 1048576.0);
+        else
+            fprintf(stderr, "free GPU memory unknown\n");
     }
 }
 
@@ -525,6 +787,20 @@ static void frame_loop(App &app)
             continue;
         }
 
+        // Create the swapchain now that the headset's field of view is known
+        // (the pose is valid) and, for --vr, the video has loaded: its size
+        // caps how many texels are worth having. Until the video is there
+        // --vr has nothing to show, so it submits no layers.
+        if (app.swapchains.empty()) {
+            int64_t src_w = 0, src_h = 0;
+            const bool have_size = read_video_size(app, src_w, src_h);
+            if (app.vr && !have_size) {
+                end_frame_empty(app, fs.predictedDisplayTime);
+                continue;
+            }
+            create_swapchain(app, views, src_w, src_h);
+        }
+
         if (app.submitted == 0)
             fprintf(stderr,
                 "mpv-vr: first valid head pose after %ld skipped frame(s); "
@@ -635,9 +911,7 @@ static void frame_loop(App &app)
         double show_h = 0, show_v = 0; // angles the layer actually spans
         double crop_x = 1.0, crop_y = 1.0;
         if (app.vr) {
-            vfov_deg = app.vfov_deg > 0
-                           ? app.vfov_deg
-                           : std::min(180.0, app.hfov_deg / app.eye_aspect);
+            vfov_deg = vr_vfov(app);
             const double want_h = app.hfov_deg * app.zoom;
             const double want_v = vfov_deg * app.zoom;
             show_h = std::min(want_h, 360.0);
@@ -1066,41 +1340,16 @@ int main(int argc, char **argv)
                                       XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
                                       app.viewCount, &n, conf.data());
     app.viewCount = n;
-    const uint32_t rec_w = conf[0].recommendedImageRectWidth
-                               ? conf[0].recommendedImageRectWidth : 1280;
-    const uint32_t rec_h = conf[0].recommendedImageRectHeight
-                               ? conf[0].recommendedImageRectHeight : 720;
-
-    // Per-eye picture size in the swapchain. Flat: the recommended size. VR:
-    // scaled up with the angle covered (see VR_HEADSET_FOV_DEG), never below
-    // the recommended size.
-    uint32_t eye_w = rec_w, eye_h = rec_h;
-    if (app.vr) {
-        // The zoom enlarges the picture without adding pixels, so the
-        // texture is scaled with it too to keep the same sharpness (any part
-        // that gets cropped away is wasted, but the visible part stays crisp).
-        double vf = app.vfov_deg > 0 ? app.vfov_deg : std::min(app.hfov_deg, 180.0);
-        double hz = app.hfov_deg * app.zoom;
-        double vz = vf * app.zoom;
-        eye_w = (uint32_t)std::max<double>(
-            rec_w, std::min(MAX_VR_EYE_DIM, rec_w * hz / VR_HEADSET_FOV_DEG));
-        eye_h = (uint32_t)std::max<double>(
-            rec_h, std::min(MAX_VR_EYE_DIM, rec_h * vz / VR_HEADSET_FOV_DEG));
-    }
-    // The swapchain holds both eyes packed the same way as the video: twice
-    // as wide for side-by-side, twice as tall for top-bottom.
-    app.width = eye_w * (app.layout == Layout::SideBySide ? 2 : 1);
-    app.height = eye_h * (app.layout == Layout::TopBottom ? 2 : 1);
-    // No clamp against XrViewConfigurationView::maxImageRectWidth/Height: those
-    // limit one view's image rectangle, not a swapchain that packs two eyes,
-    // and some runtimes report them equal to the recommended size. If
-    // xrCreateSwapchain fails below for a large --vr picture, lower
-    // MAX_VR_EYE_DIM.
-    // Keep both even so the halves split exactly.
-    app.width &= ~1u;
-    app.height &= ~1u;
-    fprintf(stderr, "mpv-vr: swapchain %ux%u (recommended per eye %ux%u)\n",
-            app.width, app.height, rec_w, rec_h);
+    // The runtime's recommended per-eye size is the floor for our own sizing.
+    // The swapchain itself is created later, from the frame loop (see
+    // create_swapchain), once the headset's field of view and the video's size
+    // are known.
+    app.rec_w = conf[0].recommendedImageRectWidth
+                    ? conf[0].recommendedImageRectWidth : 1280;
+    app.rec_h = conf[0].recommendedImageRectHeight
+                    ? conf[0].recommendedImageRectHeight : 720;
+    fprintf(stderr, "mpv-vr: runtime recommends %ux%u per eye\n", app.rec_w,
+            app.rec_h);
 
     // Pick a swapchain format the runtime offers. Prefer plain GL_RGBA8:
     // video pixels are already gamma-encoded, so we want them stored as-is
@@ -1130,26 +1379,9 @@ int main(int argc, char **argv)
             format == (int64_t)GL_RGBA8 ? " (GL_RGBA8)"
             : format == (int64_t)GL_SRGB8_ALPHA8 ? " (GL_SRGB8_ALPHA8)" : "");
 
-    // One swapchain for everything: both eyes' pictures are packed into it
-    // (or it is a single picture for plain 2D), and the layers pick out the
-    // right part per eye.
-    app.swapchains.resize(1);
-    {
-        XrSwapchainCreateInfo c = {};
-        c.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-        c.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        c.format = format;
-        c.sampleCount = 1;
-        c.width = app.width;
-        c.height = app.height;
-        c.faceCount = 1;
-        c.arraySize = 1;
-        c.mipCount = 1;
-        XR_CHECK(xrCreateSwapchain(app.session, &c, &app.swapchains[0]));
-    }
-    app.images.resize(1);
-    app.fbos.resize(1);
-    create_fbos(app);
+    // The swapchain (one for everything: both eyes' pictures are packed into
+    // it, or it is a single picture for plain 2D) is created from the frame
+    // loop, see create_swapchain.
 
     // Flat screen space: origin at the quad, QUAD_Z in front of the head (so
     // the quad is where you're looking). Head-locked: it follows the head.
