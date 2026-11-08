@@ -56,6 +56,7 @@ const GLubyte *glGetStringi(GLenum name, GLuint index);
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 #include <dlfcn.h>
 
@@ -155,6 +156,9 @@ struct App {
     // memory. mpv falls back to software decoding if neither can handle the
     // stream. Override with --hwdec=<value> (e.g. --hwdec=no).
     std::string hwdec = "nvdec,nvdec-copy";
+    // Extra mpv options from --mpv=name=value (repeatable), applied after our
+    // own settings so they can override e.g. hwdec or video-sync.
+    std::vector<std::pair<std::string, std::string>> mpv_opts;
 
     bool quit = false;
 
@@ -1116,7 +1120,12 @@ static void print_usage()
         "                      360 x 180 deg, so past that its edges are cropped\n"
         "\n"
         "other:\n"
-        "  --hwdec=<value>     mpv hwdec (default nvdec,nvdec-copy; no = software)\n");
+        "  --hwdec=<value>     mpv hwdec (default nvdec,nvdec-copy; no = software)\n"
+        "  --mpv=<name>[=<value>]\n"
+        "                      pass any mpv option; repeat for several, e.g.\n"
+        "                      --mpv=scale=ewa_lanczos --mpv=\"sub-file=/my dir/a.srt\"\n"
+        "                      (no value = yes, no-<name> = no). Applied after\n"
+        "                      mpv-vr's own settings; vo and keepaspect are fixed\n");
 }
 
 int main(int argc, char **argv)
@@ -1163,6 +1172,30 @@ int main(int argc, char **argv)
             app.valign_deg = parse_number(v, "--valignment", -20.0, 20.0);
         } else if ((v = flag_value(argc, argv, i, "--hwdec"))) {
             app.hwdec = v;
+        } else if ((v = flag_value(argc, argv, i, "--mpv"))) {
+            // --mpv=name=value. Also accepted, as on mpv's own command line:
+            // a leading "--", a bare name meaning "yes" (--mpv=pause), and
+            // "no-name" meaning "name=no" (--mpv=no-audio).
+            std::string opt = v;
+            while (!opt.empty() && opt[0] == '-')
+                opt.erase(0, 1);
+            std::string name = opt, value = "yes";
+            const size_t eq = opt.find('=');
+            if (eq != std::string::npos) {
+                name = opt.substr(0, eq);
+                value = opt.substr(eq + 1);
+            } else if (name.size() > 3 && name.compare(0, 3, "no-") == 0) {
+                name.erase(0, 3);
+                value = "no";
+            }
+            if (name.empty())
+                die("--mpv needs an option, e.g. --mpv=scale=ewa_lanczos");
+            // These two are what makes mpv render into our swapchain: without
+            // them you get a desktop window or a distorted picture.
+            if (name == "vo" || name == "keepaspect")
+                die("--mpv=%s: mpv-vr sets this itself and it can't be changed",
+                    name.c_str());
+            app.mpv_opts.emplace_back(name, value);
         } else if (std::strncmp(argv[i], "--", 2) == 0) {
             print_usage();
             die("unknown option: %s", argv[i]);
@@ -1193,6 +1226,9 @@ int main(int argc, char **argv)
         app.layout == Layout::None)
         fprintf(stderr, "mpv-vr: warning: --halignment/--valignment have no "
                         "effect without --sbs or --tb\n");
+    if (app.solid && !app.mpv_opts.empty())
+        fprintf(stderr, "mpv-vr: warning: --mpv options have no effect with "
+                        "--solid (mpv is not used)\n");
     if (!app.solid && video == nullptr) {
         print_usage();
         return 1;
@@ -1436,6 +1472,19 @@ int main(int argc, char **argv)
         mpv_set_option_string(app.mpv, "hwdec", app.hwdec.c_str());
         // Allow hwdec for every codec (older mpv builds restrict the list).
         mpv_set_option_string(app.mpv, "hwdec-codecs", "all");
+
+        // User options (--mpv=name=value), applied after ours so they can
+        // override e.g. hwdec or video-sync. A rejected option is a typo or
+        // something this mpv build doesn't have: say so instead of ignoring it.
+        for (const auto &o : app.mpv_opts) {
+            const int eopt = mpv_set_option_string(app.mpv, o.first.c_str(),
+                                                   o.second.c_str());
+            if (eopt < 0)
+                die("mpv rejected option '%s=%s': %s", o.first.c_str(),
+                    o.second.c_str(), mpv_error_string(eopt));
+            fprintf(stderr, "mpv-vr: mpv option %s=%s\n", o.first.c_str(),
+                    o.second.c_str());
+        }
 
         // mpv_create() only returns a PRE-initialized handle; the core must be
         // explicitly started before it will process commands such as loadfile.
