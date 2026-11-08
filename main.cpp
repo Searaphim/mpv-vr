@@ -2,7 +2,7 @@
 //
 // The video is shown on a fixed quad ~4 m in front of the viewer. mpv renders
 // into ONE shared OpenXR swapchain texture (both eyes see the same image; the
-// quad layer supplies the stereo) via its OpenGL render API, no VO.
+// quad layer supplies the stereo) via its OpenGL render API, no VO window.
 //
 // Stack: Wayland + EGL + OpenXR (Monado XR_MNDX_egl_enable) + mpv.
 // We build a headless EGL/GL context off the wl_display and hand it to
@@ -48,6 +48,10 @@ GLenum glGetError(void);
 #include <vector>
 #include <dlfcn.h>
 
+#ifndef GL_SRGB8_ALPHA8
+#define GL_SRGB8_ALPHA8 0x8C43
+#endif
+
 #define QUAD_Z (-4.0f) // quad sits this far in front of the initial head pose
 
 [[noreturn]] static void die(const char *fmt, ...)
@@ -82,6 +86,9 @@ struct App {
     XrSpace viewSpace{};
     uint32_t viewCount = 0;
     uint32_t width = 0, height = 0;
+    // GL internal format of the swapchain textures (e.g. GL_RGBA8). Passed to
+    // mpv as the FBO's internal_format so it doesn't have to guess.
+    int64_t format = 0;
     std::vector<XrSwapchain> swapchains;
     // Concrete type (24 B), not the 16 B base header: the runtime writes the
     // full XrSwapchainImageOpenGLKHR per element, so the buffer must match.
@@ -91,6 +98,11 @@ struct App {
     // mpv
     mpv_handle *mpv = nullptr;
     mpv_render_context *render = nullptr;
+    // Value for mpv's "hwdec" option. A comma-separated list is tried in
+    // order: zero-copy NVDEC first, then NVDEC with a copy back to system
+    // memory. mpv falls back to software decoding if neither can handle the
+    // stream. Override with --hwdec=<value> (e.g. --hwdec=no).
+    std::string hwdec = "nvdec,nvdec-copy";
 
     bool quit = false;
     // Mode flags (exactly one is true after argument parsing).
@@ -124,6 +136,7 @@ static void print_mpv_status(App &app)
     double tpos = -1, dur = -1;
     int64_t w = 0, h = 0;
     char *vo = nullptr;
+    char *hw = nullptr;
     // Print the mpv_error return codes: a nonzero code means the
     // get_property call itself failed, as opposed to the property simply
     // being "no video" (which returns success with a zero/default value).
@@ -133,12 +146,15 @@ static void print_mpv_status(App &app)
     mpv_get_property(app.mpv, "width", MPV_FORMAT_INT64, &w);
     mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &h);
     int e_vo = mpv_get_property(app.mpv, "current-vo", MPV_FORMAT_STRING, &vo);
+    // "no" means software decoding; otherwise the active hwdec (nvdec, ...).
+    mpv_get_property(app.mpv, "hwdec-current", MPV_FORMAT_STRING, &hw);
     fprintf(stderr,
-            "mpv-vr: mpv core-idle=%d(e=%d) vo=%s(e=%d) tpos=%.2f dur=%.2f "
-            "%lldx%lld\n",
-            core_idle, (int)e_ci, vo ? vo : "(none)", (int)e_vo, tpos, dur,
-            (long long)w, (long long)h);
+            "mpv-vr: mpv core-idle=%d(e=%d) vo=%s(e=%d) hwdec=%s tpos=%.2f "
+            "dur=%.2f %lldx%lld\n",
+            core_idle, (int)e_ci, vo ? vo : "(none)", (int)e_vo,
+            hw ? hw : "(none)", tpos, dur, (long long)w, (long long)h);
     mpv_free(vo);
+    mpv_free(hw);
 }
 
 static void poll_events(App &app)
@@ -330,26 +346,35 @@ static void frame_loop(App &app)
                 glClear(GL_COLOR_BUFFER_BIT);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
             } else {
-                // Diagnostic clear: shows until mpv's first frame overwrites it.
-                // If mpv ever fails to render, you keep seeing this (magenta,
-                // distinct from --solid's turquoise) = "pipeline works up to
-                // mpv". Remove once the mpv path is confirmed working.
-                glBindFramebuffer(GL_FRAMEBUFFER, app.fbos[0][idx]);
-                glClearColor(1.0f, 0.0f, 1.0f, 1.0f); // magenta
-                glClear(GL_COLOR_BUFFER_BIT);
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                // Let mpv process pending state (new decoded frame, option
+                // changes, ...). We always render below, whether or not a new
+                // video frame arrived: the swapchain rotates through several
+                // images, so skipping the render on a "no new frame" tick
+                // would present a stale/uninitialised image. mpv simply
+                // redraws the current frame in that case.
+                uint64_t flags = mpv_render_context_update(app.render);
+                (void)flags; // MPV_RENDER_UPDATE_FRAME set = new video frame
 
                 mpv_opengl_fbo fbo = {
                     .fbo = (int)app.fbos[0][idx],
                     .w = (int)app.width,
                     .h = (int)app.height,
-                    .internal_format = 0,
+                    // The real swapchain format, so mpv doesn't guess (a
+                    // wrong guess gives washed-out or too-dark colors).
+                    .internal_format = (int)app.format,
                 };
+                // OpenXR GL swapchain textures are top-down relative to mpv's
+                // default FBO orientation, so flip vertically.
+                int flip_y = 1;
                 mpv_render_param rp[] = {
                     { MPV_RENDER_PARAM_OPENGL_FBO, &fbo },
+                    { MPV_RENDER_PARAM_FLIP_Y, &flip_y },
                     { MPV_RENDER_PARAM_INVALID, nullptr },
                 };
                 mpv_render_context_render(app.render, rp);
+                // Make sure mpv's GL commands are submitted before the
+                // compositor reads the texture.
+                glFlush();
             }
 
             XrSwapchainImageReleaseInfo ri = {};
@@ -430,11 +455,12 @@ static void shutdown(App &app)
 
 int main(int argc, char **argv)
 {
-    // usage: mpv-vr [--solid | --flat] <video file>
+    // usage: mpv-vr [--solid | --flat] [--hwdec=<value>] <video file>
     //   --solid  diagnostic: clear the swapchain to flat turquoise, no mpv
     //             (confirms the XR/swapchain/FBO/composition path, no video)
     //   --flat   render <video file> with mpv, flat on the quad (the real 2D
     //             path); also the default when a video is given without a mode
+    //   --hwdec= mpv hwdec value (default "nvdec,nvdec-copy"; "no" = software)
     App app;
     const char *video = nullptr;
     for (int i = 1; i < argc; i++) {
@@ -442,6 +468,8 @@ int main(int argc, char **argv)
             app.solid = true;
         else if (std::strcmp(argv[i], "--flat") == 0)
             app.flat = true;
+        else if (std::strncmp(argv[i], "--hwdec=", 8) == 0)
+            app.hwdec = argv[i] + 8;
         else if (video == nullptr)
             video = argv[i];
         else
@@ -594,15 +622,33 @@ int main(int argc, char **argv)
     app.height = conf[0].recommendedImageRectHeight ? conf[0].recommendedImageRectHeight
                                                     : 720;
 
-    // Pick a swapchain format the runtime offers (0 if it doesn't say).
+    // Pick a swapchain format the runtime offers. Prefer plain GL_RGBA8:
+    // video pixels are already gamma-encoded, so we want them stored as-is
+    // rather than run through sRGB conversion. Fall back to whatever the
+    // runtime lists first (0 if it doesn't say).
     uint32_t nf = 0;
     xrEnumerateSwapchainFormats(app.session, 0, &nf, nullptr);
     int64_t format = 0;
     if (nf > 0) {
         std::vector<int64_t> formats(nf);
         xrEnumerateSwapchainFormats(app.session, nf, &nf, formats.data());
+        fprintf(stderr, "mpv-vr: runtime swapchain formats:");
+        for (auto f : formats)
+            fprintf(stderr, " 0x%llx", (unsigned long long)f);
+        fputc('\n', stderr);
         format = formats[0];
+        for (auto f : formats) {
+            if (f == (int64_t)GL_RGBA8) {
+                format = f;
+                break;
+            }
+        }
     }
+    app.format = format;
+    fprintf(stderr, "mpv-vr: using swapchain format 0x%llx%s\n",
+            (unsigned long long)format,
+            format == (int64_t)GL_RGBA8 ? " (GL_RGBA8)"
+            : format == (int64_t)GL_SRGB8_ALPHA8 ? " (GL_SRGB8_ALPHA8)" : "");
 
     // One swapchain for the quad layer: both eyes see the SAME image, so a
     // single (non per-eye) swapchain is all we need.
@@ -644,7 +690,23 @@ int main(int argc, char **argv)
         app.mpv = mpv_create();
         if (!app.mpv)
             die("mpv_create() failed");
+
+        // Options must be set BEFORE mpv_initialize().
+        //
+        // vo=libmpv: without this mpv opens its own gpu-next window on the
+        // desktop and the render context never receives any video (black
+        // frames in the FBO). libmpv is the VO that feeds the render API.
         mpv_set_option_string(app.mpv, "vo", "libmpv");
+        // There is no real display for mpv to sync to, so sync to audio
+        // instead of the default display-sync logic.
+        mpv_set_option_string(app.mpv, "video-sync", "audio");
+        // Hardware decoding on the NVIDIA GPU. nvdec = zero-copy via
+        // CUDA-GL interop; nvdec-copy = same decoder, frames copied back to
+        // system memory (more compatible, slower at 8K).
+        mpv_set_option_string(app.mpv, "hwdec", app.hwdec.c_str());
+        // Allow hwdec for every codec (older mpv builds restrict the list).
+        mpv_set_option_string(app.mpv, "hwdec-codecs", "all");
+
         // mpv_create() only returns a PRE-initialized handle; the core must be
         // explicitly started before it will process commands such as loadfile.
         // Without this, mpv_command() returns MPV_ERROR_UNINITIALIZED (-3) and
