@@ -1,8 +1,16 @@
-// mpv-vr: minimal VR test player for flat (2D) video.
+// mpv-vr: minimal VR video player for flat (2D/3D) and VR180/VR360 video.
 //
-// The video is shown on a fixed quad ~4 m in front of the viewer. mpv renders
-// into ONE shared OpenXR swapchain texture (both eyes see the same image; the
-// quad layer supplies the stereo) via its OpenGL render API, no VO window.
+// mpv renders into ONE OpenXR swapchain texture via its OpenGL render API (no
+// VO window). What the headset shows depends on the mode:
+//
+//   --flat (default)  the video on a flat quad screen ~4 m in front of the
+//                     viewer. Plain 2D, or stereo 3D when a layout is given
+//                     (--sbs / --tb): one quad per eye, each showing its own
+//                     half of the frame ("3D theater").
+//   --vr              equirectangular VR video (VR180, VR360, or anything in
+//                     between, set with --hfov / --vfov) wrapped around the
+//                     viewer with XR_KHR_composition_layer_equirect2. Needs
+//                     --sbs or --tb: one layer per eye.
 //
 // Stack: Wayland + EGL + OpenXR (Monado XR_MNDX_egl_enable) + mpv.
 // We build a headless EGL/GL context off the wl_display and hand it to
@@ -39,7 +47,9 @@ GLenum glGetError(void);
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -52,7 +62,22 @@ GLenum glGetError(void);
 #define GL_SRGB8_ALPHA8 0x8C43
 #endif
 
-#define QUAD_Z (-4.0f) // quad sits this far in front of the initial head pose
+#define QUAD_Z (-4.0f)      // flat screen sits this far in front of the head
+#define QUAD_WIDTH (2.0f)   // flat screen width in metres
+
+// VR swapchain sizing. The runtime's recommended per-eye size is meant for
+// the headset's own field of view, so a 360-degree picture squeezed into it
+// would be very soft. We scale the per-eye size with the angle covered,
+// assuming the recommended size spans roughly VR_HEADSET_FOV_DEG degrees, and
+// cap it at MAX_VR_EYE_DIM pixels (a SBS/TB pair is then at most twice that,
+// which stays within the usual 16384 GL texture limit).
+#define VR_HEADSET_FOV_DEG 100.0
+#define MAX_VR_EYE_DIM 8192.0
+
+// Equirect layer radius. Zero means an infinitely distant sphere, which is
+// what you want for VR video: only the viewing direction matters, so there is
+// no parallax from head movement.
+#define VR_SPHERE_RADIUS 0.0f
 
 [[noreturn]] static void die(const char *fmt, ...)
 {
@@ -72,6 +97,19 @@ GLenum glGetError(void);
             die("%s -> %d (0x%x)", #expr, (int)_r, (unsigned)_r);             \
     } while (0)
 
+// How the left-eye and right-eye pictures are packed into the video frame.
+enum class Layout {
+    None,        // one picture (plain 2D video)
+    SideBySide,  // left eye = left half, right eye = right half
+    TopBottom,   // left eye = top half, right eye = bottom half
+};
+
+// Whether each eye's picture is squeezed to fit the frame.
+//   Half: squeezed (a 1920x1080 SBS frame holds two 960x1080 pictures)
+//   Full: not squeezed (a 3840x1080 SBS frame holds two 1920x1080 pictures)
+//   Auto: decide from the frame's shape (see update_eye_aspect)
+enum class Packing { Auto, Half, Full };
+
 struct App {
     // Wayland + a headless EGL/GL context (handed to Monado for the swapchains)
     wl_display *wl = nullptr;
@@ -83,9 +121,14 @@ struct App {
     XrInstance instance{};
     XrSystemId systemId{};
     XrSession session{};
+    // Head-locked space, offset QUAD_Z in front of the head: the flat screen
+    // lives here, and xrLocateViews is relative to it.
     XrSpace viewSpace{};
+    // World-fixed space for VR content (--vr only), so the picture stays put
+    // when you turn your head.
+    XrSpace localSpace{};
     uint32_t viewCount = 0;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0; // swapchain size (BOTH eyes if packed)
     // GL internal format of the swapchain textures (e.g. GL_RGBA8). Passed to
     // mpv as the FBO's internal_format so it doesn't have to guess.
     int64_t format = 0;
@@ -105,19 +148,25 @@ struct App {
     std::string hwdec = "nvdec,nvdec-copy";
 
     bool quit = false;
-    // Mode flags (exactly one is true after argument parsing).
+
+    // ---- Modes and options (set by argument parsing) ----
     // --solid: diagnostic; clear the swapchain to flat turquoise, no mpv
     //   (confirms the XR/swapchain/FBO/composition path on its own).
-    // --flat: render the video with mpv, flat on the quad (the real 2D path).
     bool solid = false;
-    bool flat = false;
-    // --3d: the video is side-by-side stereo (left half = left eye, right half
-    // = right eye), shown as a "3D theater" screen. Implies flat-style mpv
-    // rendering; the swapchain holds both eyes side by side.
-    bool stereo = false;
-    // Aspect ratio (w/h) of ONE eye's picture, derived from the video's size
-    // once mpv has loaded it. 0 = not known yet.
-    double eye_aspect = 0;
+    // --vr: equirect sphere section around the viewer. Otherwise (the
+    // default) the video goes on a flat quad screen.
+    bool vr = false;
+    Layout layout = Layout::None; // --sbs / --tb
+    Packing packing = Packing::Auto; // --sbs=half|full, --tb=half|full
+    bool swap_eyes = false; // --swap-eyes
+    double hfov_deg = 180.0; // --hfov (VR only)
+    double vfov_deg = 0.0;   // --vfov (VR only); 0 = derive from the picture
+    // Aspect ratio (w/h) of ONE eye's picture. Set by --aspect, otherwise
+    // derived from the video's size once mpv has loaded it. 0 = not known yet.
+    double eye_aspect = 0.0;
+
+    // Log VR angles once.
+    bool vr_logged = false;
     // Frames where the head pose was invalid and the layer was skipped.
     long skipped = 0;
     // Frames where a valid pose was present and the layer was submitted.
@@ -131,6 +180,22 @@ static void *gl_get_proc(void *, const char *name)
 {
     void *p = reinterpret_cast<void *>(eglGetProcAddress(name));
     return p ? p : dlsym(RTLD_DEFAULT, name);
+}
+
+static bool runtime_has_extension(const char *name)
+{
+    uint32_t n = 0;
+    xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr);
+    std::vector<XrExtensionProperties> props(n);
+    for (auto &p : props) {
+        p = {};
+        p.type = XR_TYPE_EXTENSION_PROPERTIES;
+    }
+    xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data());
+    for (auto &p : props)
+        if (std::strcmp(p.extensionName, name) == 0)
+            return true;
+    return false;
 }
 
 // Diagnostic: print mpv's playback state so we can tell "no video loaded"
@@ -228,16 +293,25 @@ static void create_fbos(App &app)
     }
 }
 
-// 3D mode: work out the aspect ratio of ONE eye's picture from the video size.
-// A side-by-side file is either
-//   - full SBS: each eye is a normal picture, so the frame is ~2x as wide as a
-//     normal one (16:9 per eye -> 32:9 frame, ratio ~3.56 or more), or
-//   - half SBS: each eye is squeezed to half width, so the frame itself has a
-//     normal ratio (16:9 = 1.78, up to ~2.4 for scope films).
-// No normal frame is wider than ~2.4 and no full-SBS frame is narrower than
-// ~2.7, so a threshold of 3.0 separates them. Then, for half SBS the quad has
-// to be the full frame's ratio (the stretch undoes the squeeze), and for full
-// SBS it is half the frame's ratio.
+// Work out the aspect ratio of ONE eye's picture from the loaded video's size
+// (unless --aspect already set it). Called every frame until it succeeds,
+// because the video loads asynchronously.
+//
+// The frame's own aspect ratio is `frame`. How it relates to one eye's
+// picture depends on the layout and on whether the eyes are squeezed:
+//
+//   no layout             eye = frame
+//   SBS, full (unsqueezed) eye = frame / 2     (each eye gets half the width)
+//   SBS, half (squeezed)   eye = frame         (squeeze undone on display)
+//   TB,  full (unsqueezed) eye = frame * 2     (each eye gets half the height)
+//   TB,  half (squeezed)   eye = frame
+//
+// With Packing::Auto in flat mode we guess from the frame's shape. No normal
+// movie frame is wider than ~2.4 and no full-SBS frame is narrower than ~2.7,
+// so SBS wider than 3.0 is full. For TB a full-TB frame of a normal movie is
+// at most ~1.2 and a half-TB frame is at least ~1.33, so TB narrower than
+// 1.25 is full (a narrower margin than SBS: use =half/=full if it guesses
+// wrong). In VR mode Auto means full: VR video is not normally squeezed.
 static void update_eye_aspect(App &app)
 {
     if (app.eye_aspect > 0 || !app.mpv)
@@ -247,13 +321,75 @@ static void update_eye_aspect(App &app)
         mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &h) < 0 ||
         w <= 0 || h <= 0)
         return; // video not loaded yet
+
+    // Prefer the display aspect (accounts for non-square pixels); fall back
+    // to the plain pixel ratio.
     double frame = (double)w / (double)h;
-    bool full = frame > 3.0;
-    app.eye_aspect = full ? frame / 2.0 : frame;
+    double dar = 0;
+    if (mpv_get_property(app.mpv, "video-params/aspect", MPV_FORMAT_DOUBLE,
+                        &dar) >= 0 && dar > 0)
+        frame = dar;
+
+    const char *what = "single picture";
+    bool full = false;
+    switch (app.layout) {
+    case Layout::SideBySide:
+        full = app.packing == Packing::Full ||
+               (app.packing == Packing::Auto && (app.vr || frame > 3.0));
+        app.eye_aspect = full ? frame / 2.0 : frame;
+        what = full ? "full SBS" : "half SBS";
+        break;
+    case Layout::TopBottom:
+        full = app.packing == Packing::Full ||
+               (app.packing == Packing::Auto && (app.vr || frame < 1.25));
+        app.eye_aspect = full ? frame * 2.0 : frame;
+        what = full ? "full TB" : "half TB";
+        break;
+    case Layout::None:
+        app.eye_aspect = frame;
+        break;
+    }
     fprintf(stderr,
-            "mpv-vr: 3D video %lldx%lld -> %s SBS, per-eye aspect %.3f\n",
-            (long long)w, (long long)h, full ? "full" : "half",
-            app.eye_aspect);
+            "mpv-vr: video %lldx%lld (frame aspect %.3f) -> %s, per-eye "
+            "aspect %.3f\n",
+            (long long)w, (long long)h, frame, what, app.eye_aspect);
+}
+
+// The part of the swapchain that holds one eye's picture (eye 0 = left).
+// With --swap-eyes the two parts trade places.
+static XrSwapchainSubImage eye_sub_image(const App &app, int eye)
+{
+    XrSwapchainSubImage s = {};
+    s.swapchain = app.swapchains[0];
+    s.imageArrayIndex = 0;
+    const int w = (int)app.width, h = (int)app.height;
+    const int src = app.swap_eyes ? 1 - eye : eye;
+    switch (app.layout) {
+    case Layout::SideBySide:
+        s.imageRect.offset = { src * (w / 2), 0 };
+        s.imageRect.extent = { w / 2, h };
+        break;
+    case Layout::TopBottom:
+        s.imageRect.offset = { 0, src * (h / 2) };
+        s.imageRect.extent = { w, h / 2 };
+        break;
+    case Layout::None:
+        s.imageRect.offset = { 0, 0 };
+        s.imageRect.extent = { w, h };
+        break;
+    }
+    return s;
+}
+
+static void end_frame_empty(App &app, XrTime displayTime)
+{
+    XrFrameEndInfo fei = {};
+    fei.type = XR_TYPE_FRAME_END_INFO;
+    fei.displayTime = displayTime;
+    fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    fei.layerCount = 0;
+    fei.layers = nullptr;
+    XR_CHECK(xrEndFrame(app.session, &fei));
 }
 
 static void frame_loop(App &app)
@@ -284,13 +420,7 @@ static void frame_loop(App &app)
         XR_CHECK(xrBeginFrame(app.session, &fb));
 
         if (!fs.shouldRender) {
-            XrFrameEndInfo fei = {};
-            fei.type = XR_TYPE_FRAME_END_INFO;
-            fei.displayTime = fs.predictedDisplayTime;
-            fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-            fei.layerCount = 0;
-            fei.layers = nullptr;
-            XR_CHECK(xrEndFrame(app.session, &fei));
+            end_frame_empty(app, fs.predictedDisplayTime);
             continue;
         }
 
@@ -313,7 +443,7 @@ static void frame_loop(App &app)
         // As in the working openxr-simple-playground, check the view state
         // and, when the orientation is not valid, end the frame with no
         // layers (skip this frame) instead of submitting a bad pose. The
-        // quad appears as soon as tracking delivers a valid pose.
+        // picture appears as soon as tracking delivers a valid pose.
         bool pose_valid =
             (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
         for (uint32_t i = 0; i < n; i++) {
@@ -335,13 +465,18 @@ static void frame_loop(App &app)
                     views[0].pose.position.z);
             }
             app.skipped++;
-            XrFrameEndInfo fei = {};
-            fei.type = XR_TYPE_FRAME_END_INFO;
-            fei.displayTime = fs.predictedDisplayTime;
-            fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-            fei.layerCount = 0;
-            fei.layers = nullptr;
-            XR_CHECK(xrEndFrame(app.session, &fei));
+            end_frame_empty(app, fs.predictedDisplayTime);
+            continue;
+        }
+
+        // Learn the per-eye aspect from the video once it has loaded.
+        update_eye_aspect(app);
+
+        // VR with no explicit --vfov needs the aspect to know how tall the
+        // sphere section is. Until the video size is known there is nothing
+        // sensible to show, so submit no layers for these first frames.
+        if (app.vr && app.vfov_deg <= 0 && app.eye_aspect <= 0) {
+            end_frame_empty(app, fs.predictedDisplayTime);
             continue;
         }
 
@@ -356,8 +491,10 @@ static void frame_loop(App &app)
                 views[0].pose.position.z);
         app.submitted++;
 
-        // Render this frame into the quad's swapchain image. Both eyes see the
-        // same image; the quad layer (a real 3D object) provides the stereo.
+        // Render this frame into the swapchain image. For a packed layout the
+        // whole side-by-side / top-bottom frame is stretched over the whole
+        // texture (keepaspect=no), so each eye's half of the video lands
+        // exactly on its half of the texture.
         {
             // Monado requires acquire BEFORE wait: the acquire reserves an
             // image index, and the wait blocks until the compositor is done
@@ -415,69 +552,92 @@ static void frame_loop(App &app)
             XrSwapchainImageReleaseInfo ri = {};
             ri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
             XR_CHECK(xrReleaseSwapchainImage(app.swapchains[0], &ri));
-            if (app.flat)
+            if (!app.solid)
                 mpv_render_context_report_swap(app.render);
         }
 
         if (++frame % 60 == 0)
             print_mpv_status(app);
 
-        // One QUAD layer: a single image on a flat screen in front of the
-        // viewer. A quad is ONE 3D object with ONE pose (the screen's position)
-        // and a size, and both eyes see the same screen (eyeVisibility=BOTH),
-        // so each eye views it from its own angle -> correct stereo, no double
-        // vision. (A projection layer instead carries one image AND one pose
-        // PER EYE and is meant for compositing a per-eye 3D-scene render; fed a
-        // flat 2D image it shows the screen once per eye, i.e. twice.)
-        float quad_w = 2.0f; // screen width in metres
+        // Build the layers. A stereo layout gets TWO layers at the same pose,
+        // each visible to one eye only and showing its own part of the
+        // swapchain; no layout gets ONE layer visible to both eyes.
+        const bool stereo = app.layout != Layout::None;
+        const uint32_t layer_count = stereo ? 2 : 1;
         XrCompositionLayerQuad quads[2] = {};
-        uint32_t quad_count = 1;
-        if (app.stereo) {
-            // 3D theater: TWO quads at the same pose, each visible to one eye
-            // only and showing its own half of the swapchain. Both eyes see a
-            // screen at the same spot, but with different pictures -> depth.
-            update_eye_aspect(app);
-            double eye_aspect = app.eye_aspect > 0 ? app.eye_aspect : 16.0 / 9.0;
-            float quad_h = quad_w / (float)eye_aspect;
-            const int half_w = (int)app.width / 2;
-            quad_count = 2;
-            for (int eye = 0; eye < 2; eye++) {
-                XrCompositionLayerQuad &q = quads[eye];
+        XrCompositionLayerEquirect2KHR eqs[2] = {};
+        const XrCompositionLayerBaseHeader *layers[2] = {};
+
+        // Flat: a quad is ONE 3D object with ONE pose (the screen's position)
+        // and a size, so each eye views it from its own angle -> correct
+        // stereo, no double vision. (A projection layer instead carries one
+        // image AND one pose PER EYE and is meant for per-eye 3D-scene
+        // renders; fed a flat 2D image it would show the screen twice.)
+        // The screen's shape is the picture's: one eye's aspect ratio (the
+        // diagnostic --solid has no video, so it uses the swapchain's shape).
+        double aspect = app.eye_aspect > 0
+                            ? app.eye_aspect
+                            : (app.solid ? (double)app.width / (double)app.height
+                                         : 16.0 / 9.0);
+        const float quad_h = (float)(QUAD_WIDTH / aspect);
+
+        // VR: how much of the sphere the picture covers.
+        double vfov_deg = 0;
+        if (app.vr) {
+            vfov_deg = app.vfov_deg > 0
+                           ? app.vfov_deg
+                           : std::min(180.0, app.hfov_deg / app.eye_aspect);
+            if (!app.vr_logged) {
+                fprintf(stderr,
+                        "mpv-vr: VR sphere section: hfov=%.1f vfov=%.1f deg%s\n",
+                        app.hfov_deg, vfov_deg,
+                        app.vfov_deg > 0 ? "" : " (vfov derived from aspect)");
+                app.vr_logged = true;
+            }
+        }
+
+        for (uint32_t i = 0; i < layer_count; i++) {
+            const XrEyeVisibility vis =
+                !stereo ? XR_EYE_VISIBILITY_BOTH
+                        : (i == 0 ? XR_EYE_VISIBILITY_LEFT
+                                  : XR_EYE_VISIBILITY_RIGHT);
+            const XrSwapchainSubImage sub = eye_sub_image(app, (int)i);
+
+            if (app.vr) {
+                // Equirect2: the compositor maps the picture onto a section
+                // of a sphere centred on the viewer. The picture's centre
+                // faces forward in the layer's space; the section spans
+                // hfov horizontally and +-vfov/2 vertically.
+                XrCompositionLayerEquirect2KHR &e = eqs[i];
+                e.type = XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR;
+                e.space = app.localSpace;
+                e.eyeVisibility = vis;
+                e.subImage = sub;
+                e.pose.orientation = { 0, 0, 0, 1 };
+                e.pose.position = { 0, 0, 0 };
+                e.radius = VR_SPHERE_RADIUS;
+                e.centralHorizontalAngle = (float)(app.hfov_deg * M_PI / 180.0);
+                e.upperVerticalAngle = (float)(vfov_deg * 0.5 * M_PI / 180.0);
+                e.lowerVerticalAngle = -(float)(vfov_deg * 0.5 * M_PI / 180.0);
+                layers[i] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&e);
+            } else {
+                XrCompositionLayerQuad &q = quads[i];
                 q.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
                 q.space = app.viewSpace;
                 q.pose.orientation = { 0, 0, 0, 1 };
                 q.pose.position = { 0, 0, 0 }; // at viewSpace origin (4 m ahead)
-                q.size = { quad_w, quad_h };
-                q.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT
-                                           : XR_EYE_VISIBILITY_RIGHT;
-                q.subImage.swapchain = app.swapchains[0];
-                q.subImage.imageArrayIndex = 0;
-                q.subImage.imageRect.offset = { eye * half_w, 0 };
-                q.subImage.imageRect.extent = { half_w, (int)app.height };
+                q.size = { QUAD_WIDTH, quad_h };
+                q.eyeVisibility = vis;
+                q.subImage = sub;
+                layers[i] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&q);
             }
-        } else {
-            float quad_h = quad_w * (float)app.height / (float)app.width; // image aspect
-            XrCompositionLayerQuad &quad = quads[0];
-            quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
-            quad.space = app.viewSpace;
-            quad.pose.orientation = { 0, 0, 0, 1 };
-            quad.pose.position = { 0, 0, 0 }; // at viewSpace origin (4 m ahead)
-            quad.size = { quad_w, quad_h };
-            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage.swapchain = app.swapchains[0];
-            quad.subImage.imageArrayIndex = 0;
-            quad.subImage.imageRect.offset = { 0, 0 };
-            quad.subImage.imageRect.extent = { (int)app.width, (int)app.height };
         }
 
-        const XrCompositionLayerBaseHeader *layers[2] = {
-            reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quads[0]),
-            reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quads[1]) };
         XrFrameEndInfo fei = {};
         fei.type = XR_TYPE_FRAME_END_INFO;
         fei.displayTime = fs.predictedDisplayTime;
         fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        fei.layerCount = quad_count;
+        fei.layerCount = layer_count;
         fei.layers = layers;
         XR_CHECK(xrEndFrame(app.session, &fei));
     }
@@ -516,60 +676,167 @@ static void shutdown(App &app)
         wl_display_disconnect(app.wl);
 }
 
+// ---- Argument parsing helpers ----
+
+// Match "--name=value" or "--name value". Returns the value, or nullptr if
+// argv[i] is not this flag. Advances i when the value is the next argument.
+static const char *flag_value(int argc, char **argv, int &i, const char *name)
+{
+    size_t n = std::strlen(name);
+    if (std::strncmp(argv[i], name, n) != 0)
+        return nullptr;
+    if (argv[i][n] == '=')
+        return argv[i] + n + 1;
+    if (argv[i][n] == '\0') {
+        if (i + 1 >= argc)
+            die("%s needs a value", name);
+        return argv[++i];
+    }
+    return nullptr; // a different flag that merely starts with this name
+}
+
+static double parse_number(const char *s, const char *flag, double lo, double hi)
+{
+    char *end = nullptr;
+    double v = std::strtod(s, &end);
+    if (end == s || *end != '\0' || !std::isfinite(v))
+        die("%s: '%s' is not a number", flag, s);
+    if (v < lo || v > hi)
+        die("%s: %g is out of range (%g .. %g)", flag, v, lo, hi);
+    return v;
+}
+
+// Match "--sbs", "--sbs=half" or "--sbs=full" (same for --tb).
+static bool match_layout_flag(const char *arg, const char *name, Packing &p)
+{
+    size_t n = std::strlen(name);
+    if (std::strncmp(arg, name, n) != 0)
+        return false;
+    if (arg[n] == '\0') {
+        p = Packing::Auto;
+        return true;
+    }
+    if (arg[n] != '=')
+        return false;
+    const char *v = arg + n + 1;
+    if (std::strcmp(v, "half") == 0)
+        p = Packing::Half;
+    else if (std::strcmp(v, "full") == 0)
+        p = Packing::Full;
+    else
+        die("%s expects =half or =full, got '%s'", name, v);
+    return true;
+}
+
+static void print_usage()
+{
+    fprintf(stderr,
+        "usage: mpv-vr [options] <video file>\n"
+        "\n"
+        "mode (default --flat):\n"
+        "  --flat              video on a flat screen in front of you\n"
+        "  --vr                equirectangular VR video wrapped around you\n"
+        "                      (needs --sbs or --tb)\n"
+        "  --solid             diagnostic: flat turquoise, no mpv, no video needed\n"
+        "\n"
+        "stereo layout (none = plain 2D video):\n"
+        "  --sbs[=half|full]   side-by-side: left eye = left half\n"
+        "  --tb[=half|full]    top-bottom:   left eye = top half\n"
+        "                      half = each eye squeezed to half the frame,\n"
+        "                      full = each eye unsqueezed. Without =half/=full:\n"
+        "                      guessed from the frame shape in --flat, full in --vr\n"
+        "  --swap-eyes         the file has the right eye first\n"
+        "  --aspect=<x.xx>     aspect ratio (w/h) of ONE eye's picture; overrides\n"
+        "                      the value worked out from the video\n"
+        "\n"
+        "VR angles (--vr only):\n"
+        "  --hfov=<deg>        horizontal coverage, 1..360 (default 180)\n"
+        "  --vfov=<deg>        vertical coverage, 1..180 (default: derived from\n"
+        "                      hfov and the per-eye aspect, at most 180)\n"
+        "\n"
+        "other:\n"
+        "  --hwdec=<value>     mpv hwdec (default nvdec,nvdec-copy; no = software)\n");
+}
+
 int main(int argc, char **argv)
 {
-    // usage: mpv-vr [--solid | --flat | --3d] [--hwdec=<value>] <video file>
-    //   --3d     side-by-side 3D video (left half = left eye, right half =
-    //             right eye) on a "3D theater" screen; full or half SBS is
-    //             detected from the video's aspect ratio
-    //   --solid  diagnostic: clear the swapchain to flat turquoise, no mpv
-    //             (confirms the XR/swapchain/FBO/composition path, no video)
-    //   --flat   render <video file> with mpv, flat on the quad (the real 2D
-    //             path); also the default when a video is given without a mode
-    //   --hwdec= mpv hwdec value (default "nvdec,nvdec-copy"; "no" = software)
     App app;
     const char *video = nullptr;
+    bool flat_flag = false;
+    bool have_hfov = false, have_vfov = false;
+    Layout layout_flag = Layout::None;
     for (int i = 1; i < argc; i++) {
+        const char *v = nullptr;
+        Packing p = Packing::Auto;
         if (std::strcmp(argv[i], "--solid") == 0)
             app.solid = true;
         else if (std::strcmp(argv[i], "--flat") == 0)
-            app.flat = true;
-        else if (std::strcmp(argv[i], "--3d") == 0)
-            app.stereo = true;
-        else if (std::strncmp(argv[i], "--hwdec=", 8) == 0)
-            app.hwdec = argv[i] + 8;
-        else if (video == nullptr)
+            flat_flag = true;
+        else if (std::strcmp(argv[i], "--vr") == 0)
+            app.vr = true;
+        else if (std::strcmp(argv[i], "--swap-eyes") == 0)
+            app.swap_eyes = true;
+        else if (match_layout_flag(argv[i], "--sbs", p) ||
+                 match_layout_flag(argv[i], "--tb", p)) {
+            Layout l = std::strncmp(argv[i], "--sbs", 5) == 0
+                           ? Layout::SideBySide
+                           : Layout::TopBottom;
+            if (layout_flag != Layout::None)
+                die("--sbs and --tb are mutually exclusive");
+            layout_flag = l;
+            app.packing = p;
+        } else if ((v = flag_value(argc, argv, i, "--hfov"))) {
+            app.hfov_deg = parse_number(v, "--hfov", 1.0, 360.0);
+            have_hfov = true;
+        } else if ((v = flag_value(argc, argv, i, "--vfov"))) {
+            app.vfov_deg = parse_number(v, "--vfov", 1.0, 180.0);
+            have_vfov = true;
+        } else if ((v = flag_value(argc, argv, i, "--aspect"))) {
+            app.eye_aspect = parse_number(v, "--aspect", 0.05, 20.0);
+        } else if ((v = flag_value(argc, argv, i, "--hwdec"))) {
+            app.hwdec = v;
+        } else if (std::strncmp(argv[i], "--", 2) == 0) {
+            print_usage();
+            die("unknown option: %s", argv[i]);
+        } else if (video == nullptr) {
             video = argv[i];
-        else
+        } else {
             die("unexpected argument: %s", argv[i]);
-    }
-    if (app.stereo) {
-        if (app.solid)
-            die("--3d and --solid are mutually exclusive");
-        app.flat = true; // --3d renders the video with mpv, like --flat
-    }
-    if (app.solid && app.flat)
-        die("--solid and --flat are mutually exclusive");
-    if (!app.solid && !app.flat) {
-        // No explicit mode: a video means --flat; nothing at all is a usage error.
-        if (video == nullptr) {
-            fprintf(stderr,
-                    "usage: mpv-vr --solid <video>   (diagnostic: flat color, no mpv)\n"
-                    "       mpv-vr --flat  <video>   (render <video> with mpv on a quad)\n");
-            return 1;
         }
-        app.flat = true;
     }
-    if (app.flat && video == nullptr) {
-        fprintf(stderr, "usage: mpv-vr --flat <video file>\n");
+    app.layout = layout_flag;
+
+    // Mode checks.
+    if (app.solid && (flat_flag || app.vr))
+        die("--solid cannot be combined with --flat or --vr");
+    if (flat_flag && app.vr)
+        die("--flat and --vr are mutually exclusive");
+    if (app.solid && app.layout != Layout::None)
+        die("--solid cannot be combined with --sbs or --tb");
+    if ((have_hfov || have_vfov) && !app.vr)
+        die("--hfov and --vfov only apply with --vr");
+    if (app.vr && app.layout == Layout::None)
+        die("--vr needs a stereo layout: add --sbs or --tb "
+            "(mono VR video is not supported yet)");
+    if (app.swap_eyes && app.layout == Layout::None)
+        fprintf(stderr, "mpv-vr: warning: --swap-eyes has no effect without "
+                        "--sbs or --tb\n");
+    if (!app.solid && video == nullptr) {
+        print_usage();
         return 1;
     }
+
     if (app.solid)
         fprintf(stderr, "mpv-vr: --solid mode (flat turquoise, mpv disabled)\n");
-    if (app.flat)
-        fprintf(stderr, "mpv-vr: %s mode (rendering '%s' with mpv)\n",
-                app.stereo ? "--3d" : "--flat", video);
-
+    else
+        fprintf(stderr, "mpv-vr: %s mode, layout=%s, rendering '%s' with mpv\n",
+                app.vr ? "--vr" : "--flat",
+                app.layout == Layout::SideBySide ? "side-by-side"
+                : app.layout == Layout::TopBottom ? "top-bottom" : "none",
+                video);
+    if (app.eye_aspect > 0)
+        fprintf(stderr, "mpv-vr: per-eye aspect set by --aspect: %.3f\n",
+                app.eye_aspect);
 
     // Wayland first: the EGL display is built off this wl_display.
     app.wl = wl_display_connect(nullptr);
@@ -621,16 +888,23 @@ int main(int argc, char **argv)
     // XR_KHR_opengl_enable: OpenGL graphics API; Monado's EGL binding exposes
     // swapchain images as GL textures and requires the
     // xrGetOpenGLGraphicsRequirementsKHR call below.
-    const char *instance_exts[] = {
+    // XR_KHR_composition_layer_equirect2: the sphere-section layer used by
+    // --vr only.
+    std::vector<const char *> instance_exts = {
         XR_MNDX_EGL_ENABLE_EXTENSION_NAME,
         XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
     };
+    if (app.vr) {
+        if (!runtime_has_extension(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME))
+            die("the OpenXR runtime does not offer %s, which --vr needs",
+                XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
+        instance_exts.push_back(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
+    }
     XrInstanceCreateInfo ic = {};
     ic.type = XR_TYPE_INSTANCE_CREATE_INFO;
     ic.applicationInfo = appInfo;
-    ic.enabledExtensionCount =
-        (uint32_t)(sizeof instance_exts / sizeof instance_exts[0]);
-    ic.enabledExtensionNames = instance_exts;
+    ic.enabledExtensionCount = (uint32_t)instance_exts.size();
+    ic.enabledExtensionNames = instance_exts.data();
     XR_CHECK(xrCreateInstance(&ic, &app.instance));
 
     XrSystemGetInfo sg = {};
@@ -691,15 +965,36 @@ int main(int argc, char **argv)
                                       XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
                                       app.viewCount, &n, conf.data());
     app.viewCount = n;
-    app.width = conf[0].recommendedImageRectWidth ? conf[0].recommendedImageRectWidth
-                                                  : 1280;
-    app.height = conf[0].recommendedImageRectHeight ? conf[0].recommendedImageRectHeight
-                                                    : 720;
+    const uint32_t rec_w = conf[0].recommendedImageRectWidth
+                               ? conf[0].recommendedImageRectWidth : 1280;
+    const uint32_t rec_h = conf[0].recommendedImageRectHeight
+                               ? conf[0].recommendedImageRectHeight : 720;
 
-    // 3D theater: the swapchain holds both eyes side by side, so make it twice
-    // as wide to keep each eye's half at the recommended per-eye resolution.
-    if (app.stereo)
-        app.width *= 2;
+    // Per-eye picture size in the swapchain. Flat: the recommended size. VR:
+    // scaled up with the angle covered (see VR_HEADSET_FOV_DEG), never below
+    // the recommended size.
+    uint32_t eye_w = rec_w, eye_h = rec_h;
+    if (app.vr) {
+        double vf = app.vfov_deg > 0 ? app.vfov_deg : std::min(app.hfov_deg, 180.0);
+        eye_w = (uint32_t)std::max<double>(
+            rec_w, std::min(MAX_VR_EYE_DIM, rec_w * app.hfov_deg / VR_HEADSET_FOV_DEG));
+        eye_h = (uint32_t)std::max<double>(
+            rec_h, std::min(MAX_VR_EYE_DIM, rec_h * vf / VR_HEADSET_FOV_DEG));
+    }
+    // The swapchain holds both eyes packed the same way as the video: twice
+    // as wide for side-by-side, twice as tall for top-bottom.
+    app.width = eye_w * (app.layout == Layout::SideBySide ? 2 : 1);
+    app.height = eye_h * (app.layout == Layout::TopBottom ? 2 : 1);
+    // No clamp against XrViewConfigurationView::maxImageRectWidth/Height: those
+    // limit one view's image rectangle, not a swapchain that packs two eyes,
+    // and some runtimes report them equal to the recommended size. If
+    // xrCreateSwapchain fails below for a large --vr picture, lower
+    // MAX_VR_EYE_DIM.
+    // Keep both even so the halves split exactly.
+    app.width &= ~1u;
+    app.height &= ~1u;
+    fprintf(stderr, "mpv-vr: swapchain %ux%u (recommended per eye %ux%u)\n",
+            app.width, app.height, rec_w, rec_h);
 
     // Pick a swapchain format the runtime offers. Prefer plain GL_RGBA8:
     // video pixels are already gamma-encoded, so we want them stored as-is
@@ -729,8 +1024,9 @@ int main(int argc, char **argv)
             format == (int64_t)GL_RGBA8 ? " (GL_RGBA8)"
             : format == (int64_t)GL_SRGB8_ALPHA8 ? " (GL_SRGB8_ALPHA8)" : "");
 
-    // One swapchain for the quad layer: both eyes see the SAME image, so a
-    // single (non per-eye) swapchain is all we need.
+    // One swapchain for everything: both eyes' pictures are packed into it
+    // (or it is a single picture for plain 2D), and the layers pick out the
+    // right part per eye.
     app.swapchains.resize(1);
     {
         XrSwapchainCreateInfo c = {};
@@ -749,8 +1045,8 @@ int main(int argc, char **argv)
     app.fbos.resize(1);
     create_fbos(app);
 
-    // Reference space: origin at the quad, QUAD_Z in front of the initial
-    // head pose (so the quad is where you're looking when you put the headset on).
+    // Flat screen space: origin at the quad, QUAD_Z in front of the head (so
+    // the quad is where you're looking). Head-locked: it follows the head.
     XrReferenceSpaceCreateInfo rs = {};
     rs.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
@@ -758,14 +1054,25 @@ int main(int argc, char **argv)
     rs.poseInReferenceSpace.position = { 0, 0, QUAD_Z };
     XR_CHECK(xrCreateReferenceSpace(app.session, &rs, &app.viewSpace));
 
+    // VR space: fixed in the world, origin where the headset started, so the
+    // picture stays put when you turn your head.
+    if (app.vr) {
+        XrReferenceSpaceCreateInfo ls = {};
+        ls.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+        ls.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        ls.poseInReferenceSpace.orientation = { 0, 0, 0, 1 };
+        ls.poseInReferenceSpace.position = { 0, 0, 0 };
+        XR_CHECK(xrCreateReferenceSpace(app.session, &ls, &app.localSpace));
+    }
+
     XrSessionBeginInfo sb = {};
     sb.type = XR_TYPE_SESSION_BEGIN_INFO;
     sb.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     XR_CHECK(xrBeginSession(app.session, &sb));
 
-    // mpv: render API into our GL context, then load the video. Only in
-    // --flat mode (the --solid diagnostic doesn't use mpv).
-    if (app.flat) {
+    // mpv: render API into our GL context, then load the video. Not in the
+    // --solid diagnostic, which doesn't use mpv.
+    if (!app.solid) {
         app.mpv = mpv_create();
         if (!app.mpv)
             die("mpv_create() failed");
@@ -779,11 +1086,12 @@ int main(int argc, char **argv)
         // There is no real display for mpv to sync to, so sync to audio
         // instead of the default display-sync logic.
         mpv_set_option_string(app.mpv, "video-sync", "audio");
-        // 3D: stretch the whole side-by-side frame to fill the texture instead
-        // of letterboxing it, so the left/right halves of the video land
-        // exactly on the left/right halves of the swapchain.
-        if (app.stereo)
-            mpv_set_option_string(app.mpv, "keepaspect", "no");
+        // Stretch the whole video frame to fill the swapchain instead of
+        // letterboxing it. For packed stereo this makes each eye's half of
+        // the video land exactly on its half of the texture; for plain 2D the
+        // screen's shape comes from the video (not the texture), so there
+        // are no black bars baked into the picture.
+        mpv_set_option_string(app.mpv, "keepaspect", "no");
         // Hardware decoding on the NVIDIA GPU. nvdec = zero-copy via
         // CUDA-GL interop; nvdec-copy = same decoder, frames copied back to
         // system memory (more compatible, slower at 8K).
