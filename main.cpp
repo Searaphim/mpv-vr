@@ -169,6 +169,10 @@ struct App {
     double valign_deg = 0.0; // --valignment
     double hfov_deg = 180.0; // --hfov (VR only)
     double vfov_deg = 0.0;   // --vfov (VR only); 0 = derive from the picture
+    // --zoom (VR only): enlarges (>1) or shrinks (<1) the picture by scaling
+    // the angles it covers. The sphere section can't exceed 360 x 180 degrees,
+    // so beyond that the picture is cropped around its centre instead.
+    double zoom = 1.0;
     // Aspect ratio (w/h) of ONE eye's picture. Set by --aspect, otherwise
     // derived from the video's size once mpv has loaded it. 0 = not known yet.
     double eye_aspect = 0.0;
@@ -389,6 +393,21 @@ static XrSwapchainSubImage eye_sub_image(const App &app, int eye)
     return s;
 }
 
+// Keep only the central part of a sub-image: fraction fx of its width and fy of
+// its height. Used by --vr --zoom when the enlarged picture would cover more
+// of the sphere than exists. The equirect mapping is linear in angle, so the
+// centre of the rectangle is the centre of the view.
+static void crop_sub_image(XrSwapchainSubImage &s, double fx, double fy)
+{
+    const int w = s.imageRect.extent.width, h = s.imageRect.extent.height;
+    const int nw = std::max(1, (int)std::lround(w * fx));
+    const int nh = std::max(1, (int)std::lround(h * fy));
+    s.imageRect.offset.x += (w - nw) / 2;
+    s.imageRect.offset.y += (h - nh) / 2;
+    s.imageRect.extent.width = nw;
+    s.imageRect.extent.height = nh;
+}
+
 // Orientation that turns a layer's picture by a small angle: yaw (positive
 // moves the picture to the LEFT) then pitch (positive moves it UP). Used by
 // --vr, where the sphere has infinite radius so sliding a layer sideways would
@@ -607,17 +626,35 @@ static void frame_loop(App &app)
                                          : 16.0 / 9.0);
         const float quad_h = (float)(QUAD_WIDTH / aspect);
 
-        // VR: how much of the sphere the picture covers.
+        // VR: how much of the sphere the picture covers (hfov x vfov), then
+        // the zoom applied on top. Zoom scales both angles; the sphere section
+        // can't exceed 360 x 180 degrees, so whatever would stick out is
+        // cropped from the picture's edges (crop_x / crop_y = the fraction of
+        // the picture that stays visible), keeping the magnification exact.
         double vfov_deg = 0;
+        double show_h = 0, show_v = 0; // angles the layer actually spans
+        double crop_x = 1.0, crop_y = 1.0;
         if (app.vr) {
             vfov_deg = app.vfov_deg > 0
                            ? app.vfov_deg
                            : std::min(180.0, app.hfov_deg / app.eye_aspect);
+            const double want_h = app.hfov_deg * app.zoom;
+            const double want_v = vfov_deg * app.zoom;
+            show_h = std::min(want_h, 360.0);
+            show_v = std::min(want_v, 180.0);
+            crop_x = show_h / want_h;
+            crop_y = show_v / want_v;
             if (!app.vr_logged) {
                 fprintf(stderr,
                         "mpv-vr: VR sphere section: hfov=%.1f vfov=%.1f deg%s\n",
                         app.hfov_deg, vfov_deg,
                         app.vfov_deg > 0 ? "" : " (vfov derived from aspect)");
+                if (app.zoom != 1.0)
+                    fprintf(stderr,
+                            "mpv-vr: zoom %.2f -> showing %.1f x %.1f deg, "
+                            "%.0f%% x %.0f%% of the picture\n",
+                            app.zoom, show_h, show_v, crop_x * 100.0,
+                            crop_y * 100.0);
                 app.vr_logged = true;
             }
         }
@@ -645,13 +682,14 @@ static void frame_loop(App &app)
                 e.space = app.localSpace;
                 e.eyeVisibility = vis;
                 e.subImage = sub;
+                crop_sub_image(e.subImage, crop_x, crop_y);
                 e.pose.orientation =
                     alignment_orientation(-shift_right_deg, shift_up_deg);
                 e.pose.position = { 0, 0, 0 };
                 e.radius = VR_SPHERE_RADIUS;
-                e.centralHorizontalAngle = (float)(app.hfov_deg * M_PI / 180.0);
-                e.upperVerticalAngle = (float)(vfov_deg * 0.5 * M_PI / 180.0);
-                e.lowerVerticalAngle = -(float)(vfov_deg * 0.5 * M_PI / 180.0);
+                e.centralHorizontalAngle = (float)(show_h * M_PI / 180.0);
+                e.upperVerticalAngle = (float)(show_v * 0.5 * M_PI / 180.0);
+                e.lowerVerticalAngle = -(float)(show_v * 0.5 * M_PI / 180.0);
                 layers[i] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&e);
             } else {
                 XrCompositionLayerQuad &q = quads[i];
@@ -799,6 +837,9 @@ static void print_usage()
         "  --hfov=<deg>        horizontal coverage, 1..360 (default 180)\n"
         "  --vfov=<deg>        vertical coverage, 1..180 (default: derived from\n"
         "                      hfov and the per-eye aspect, at most 180)\n"
+        "  --zoom=<factor>     enlarge (>1) or shrink (<1) the picture, 0.1..10\n"
+        "                      (default 1). The picture can't cover more than\n"
+        "                      360 x 180 deg, so past that its edges are cropped\n"
         "\n"
         "other:\n"
         "  --hwdec=<value>     mpv hwdec (default nvdec,nvdec-copy; no = software)\n");
@@ -809,7 +850,7 @@ int main(int argc, char **argv)
     App app;
     const char *video = nullptr;
     bool flat_flag = false;
-    bool have_hfov = false, have_vfov = false;
+    bool have_hfov = false, have_vfov = false, have_zoom = false;
     Layout layout_flag = Layout::None;
     for (int i = 1; i < argc; i++) {
         const char *v = nullptr;
@@ -837,6 +878,9 @@ int main(int argc, char **argv)
         } else if ((v = flag_value(argc, argv, i, "--vfov"))) {
             app.vfov_deg = parse_number(v, "--vfov", 1.0, 180.0);
             have_vfov = true;
+        } else if ((v = flag_value(argc, argv, i, "--zoom"))) {
+            app.zoom = parse_number(v, "--zoom", 0.1, 10.0);
+            have_zoom = true;
         } else if ((v = flag_value(argc, argv, i, "--aspect"))) {
             app.eye_aspect = parse_number(v, "--aspect", 0.05, 20.0);
         } else if ((v = flag_value(argc, argv, i, "--halignment"))) {
@@ -863,8 +907,8 @@ int main(int argc, char **argv)
         die("--flat and --vr are mutually exclusive");
     if (app.solid && app.layout != Layout::None)
         die("--solid cannot be combined with --sbs or --tb");
-    if ((have_hfov || have_vfov) && !app.vr)
-        die("--hfov and --vfov only apply with --vr");
+    if ((have_hfov || have_vfov || have_zoom) && !app.vr)
+        die("--hfov, --vfov and --zoom only apply with --vr");
     if (app.vr && app.layout == Layout::None)
         die("--vr needs a stereo layout: add --sbs or --tb "
             "(mono VR video is not supported yet)");
@@ -1032,11 +1076,16 @@ int main(int argc, char **argv)
     // the recommended size.
     uint32_t eye_w = rec_w, eye_h = rec_h;
     if (app.vr) {
+        // The zoom enlarges the picture without adding pixels, so the
+        // texture is scaled with it too to keep the same sharpness (any part
+        // that gets cropped away is wasted, but the visible part stays crisp).
         double vf = app.vfov_deg > 0 ? app.vfov_deg : std::min(app.hfov_deg, 180.0);
+        double hz = app.hfov_deg * app.zoom;
+        double vz = vf * app.zoom;
         eye_w = (uint32_t)std::max<double>(
-            rec_w, std::min(MAX_VR_EYE_DIM, rec_w * app.hfov_deg / VR_HEADSET_FOV_DEG));
+            rec_w, std::min(MAX_VR_EYE_DIM, rec_w * hz / VR_HEADSET_FOV_DEG));
         eye_h = (uint32_t)std::max<double>(
-            rec_h, std::min(MAX_VR_EYE_DIM, rec_h * vf / VR_HEADSET_FOV_DEG));
+            rec_h, std::min(MAX_VR_EYE_DIM, rec_h * vz / VR_HEADSET_FOV_DEG));
     }
     // The swapchain holds both eyes packed the same way as the video: twice
     // as wide for side-by-side, twice as tall for top-bottom.
