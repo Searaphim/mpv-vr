@@ -205,6 +205,7 @@ struct App {
     // Aspect ratio (w/h) of ONE eye's picture. Set by --aspect, otherwise
     // derived from the video's size once mpv has loaded it. 0 = not known yet.
     double eye_aspect = 0.0;
+    bool eye_aspect_explicit = false; // --aspect: preserve across layout changes
 
     // Log VR angles once.
     bool vr_logged = false;
@@ -767,6 +768,70 @@ static void toggle_pause(App &app)
     fprintf(stderr, "mpv-vr: %s\n", paused ? "paused" : "resumed");
 }
 
+// Cycle through all display packing modes in this order:
+// mono -> SBS half -> SBS full -> TB half -> TB full -> mono.
+// Resolve Packing::Auto using the same frame-shape heuristic as
+// update_eye_aspect(), so the first key press advances from what is actually
+// being displayed rather than from an assumed default.
+static void cycle_layout(App &app)
+{
+    auto effective_packing = [&]() {
+        if (app.layout == Layout::None || app.packing != Packing::Auto)
+            return app.packing;
+
+        // VR Auto is always full packing. In flat mode, use the same
+        // aspect-ratio thresholds as update_eye_aspect().
+        if (app.vr)
+            return Packing::Full;
+
+        int64_t w = 0, h = 0;
+        if (!app.mpv ||
+            mpv_get_property(app.mpv, "width", MPV_FORMAT_INT64, &w) < 0 ||
+            mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &h) < 0 ||
+            w <= 0 || h <= 0)
+            return Packing::Half; // sensible fallback before video metadata
+
+        double frame = (double)w / (double)h;
+        double dar = 0;
+        if (mpv_get_property(app.mpv, "video-params/aspect",
+                             MPV_FORMAT_DOUBLE, &dar) >= 0 && dar > 0)
+            frame = dar;
+
+        const bool full = app.layout == Layout::SideBySide
+                              ? frame > 3.0
+                              : frame < 1.25;
+        return full ? Packing::Full : Packing::Half;
+    };
+
+    const Packing current = effective_packing();
+    const char *name = nullptr;
+    if (app.layout == Layout::None) {
+        app.layout = Layout::SideBySide;
+        app.packing = Packing::Half;
+        name = "SBS half";
+    } else if (app.layout == Layout::SideBySide && current == Packing::Half) {
+        app.packing = Packing::Full;
+        name = "SBS full";
+    } else if (app.layout == Layout::SideBySide) {
+        app.layout = Layout::TopBottom;
+        app.packing = Packing::Half;
+        name = "TB half";
+    } else if (app.layout == Layout::TopBottom && current == Packing::Half) {
+        app.packing = Packing::Full;
+        name = "TB full";
+    } else {
+        app.layout = Layout::None;
+        app.packing = Packing::Auto;
+        name = "mono";
+    }
+    if (!app.eye_aspect_explicit)
+        app.eye_aspect = 0.0;
+    destroy_swapchain(app);
+    app.vr_logged = false;
+    fprintf(stderr, "mpv-vr: layout=%s%s\n", name,
+            app.vr ? " (VR mode)" : " (flat mode)");
+}
+
 // Read whatever keys were typed since the last frame and act on them. Other
 // keys (and the bytes of escape sequences, e.g. arrow keys) are ignored.
 static void poll_keyboard(App &app)
@@ -856,6 +921,7 @@ static void poll_keyboard(App &app)
             if (app.eye_aspect > 0) {
                 app.eye_aspect = std::max(0.05, std::min(20.0,
                     app.eye_aspect + (c == '.' ? KEY_ASPECT_STEP : -KEY_ASPECT_STEP)));
+                app.eye_aspect_explicit = true;
                 fprintf(stderr, "mpv-vr: per-eye aspect=%.3f\n", app.eye_aspect);
             } else {
                 fprintf(stderr, "mpv-vr: aspect is not available until the video loads\n");
@@ -863,25 +929,20 @@ static void poll_keyboard(App &app)
             break;
         case 'v':
         case 'V':
-            if (!app.vr_extension_enabled) {
+            if (!app.vr && !app.vr_extension_enabled) {
                 fprintf(stderr, "mpv-vr: VR mode unavailable: runtime lacks %s\n",
                         XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
-            } else if (app.layout == Layout::None) {
-                fprintf(stderr, "mpv-vr: VR mode needs --sbs or --tb stereo layout\n");
-            } else if (!app.vr) {
-                app.vr = true;
+            } else {
+                app.vr = !app.vr;
                 app.vr_logged = false;
                 destroy_swapchain(app);
-                fprintf(stderr, "mpv-vr: switched to VR mode\n");
+                fprintf(stderr, "mpv-vr: switched to %s mode\n",
+                        app.vr ? "VR" : "flat");
             }
             break;
-        case 'f':
-        case 'F':
-            if (app.vr) {
-                app.vr = false;
-                destroy_swapchain(app);
-                fprintf(stderr, "mpv-vr: switched to flat mode\n");
-            }
+        case 'l':
+        case 'L':
+            cycle_layout(app);
             break;
         default:
             break;
@@ -1292,10 +1353,11 @@ static void print_usage()
         "mode (default --flat):\n"
         "  --flat              video on a flat screen in front of you\n"
         "  --vr                equirectangular VR video wrapped around you\n"
-        "                      (needs --sbs or --tb)\n"
+        "                      (mono, SBS or TB video)\n"
         "  --solid             diagnostic: flat turquoise, no mpv, no video needed\n"
         "\n"
-        "stereo layout (none = plain 2D video):\n"
+        "stereo layout (mono = plain 2D video, the default):\n"
+        "  --mono              one picture shared by both eyes\n"
         "  --sbs[=half|full]   side-by-side: left eye = left half\n"
         "  --tb[=half|full]    top-bottom:   left eye = top half\n"
         "                      half = each eye squeezed to half the frame,\n"
@@ -1335,7 +1397,9 @@ static void print_usage()
         "  . / ,               per-eye aspect +/- 0.01\n"
         "  W / S               VR: pitch up/down; flat: move screen up/down\n"
         "  A / D               VR: yaw counter-clockwise/clockwise; flat: move screen left/right\n"
-        "  v / f               switch to VR / flat mode\n");
+        "  V                   toggle VR / flat mode\n"
+        "  L                   cycle layout: mono -> SBS half -> SBS full\n"
+        "                      -> TB half -> TB full -> mono\n");
 }
 
 int main(int argc, char **argv)
@@ -1343,6 +1407,8 @@ int main(int argc, char **argv)
     App app;
     const char *video = nullptr;
     bool flat_flag = false;
+    bool mono_flag = false;
+    bool layout_flag_set = false;
     bool have_hfov = false, have_vfov = false, have_zoom = false;
     Layout layout_flag = Layout::None;
     for (int i = 1; i < argc; i++) {
@@ -1354,6 +1420,8 @@ int main(int argc, char **argv)
             flat_flag = true;
         else if (std::strcmp(argv[i], "--vr") == 0)
             app.vr = true;
+        else if (std::strcmp(argv[i], "--mono") == 0)
+            mono_flag = true;
         else if (std::strcmp(argv[i], "--swap-eyes") == 0)
             app.swap_eyes = true;
         else if (match_layout_flag(argv[i], "--sbs", p) ||
@@ -1361,8 +1429,9 @@ int main(int argc, char **argv)
             Layout l = std::strncmp(argv[i], "--sbs", 5) == 0
                            ? Layout::SideBySide
                            : Layout::TopBottom;
-            if (layout_flag != Layout::None)
-                die("--sbs and --tb are mutually exclusive");
+            if (layout_flag_set)
+                die("--mono, --sbs and --tb are mutually exclusive");
+            layout_flag_set = true;
             layout_flag = l;
             app.packing = p;
         } else if ((v = flag_value(argc, argv, i, "--hfov"))) {
@@ -1376,6 +1445,7 @@ int main(int argc, char **argv)
             have_zoom = true;
         } else if ((v = flag_value(argc, argv, i, "--aspect"))) {
             app.eye_aspect = parse_number(v, "--aspect", 0.05, 20.0);
+            app.eye_aspect_explicit = true;
         } else if ((v = flag_value(argc, argv, i, "--halignment"))) {
             app.halign_deg = parse_number(v, "--halignment", -20.0, 20.0);
         } else if ((v = flag_value(argc, argv, i, "--valignment"))) {
@@ -1415,6 +1485,8 @@ int main(int argc, char **argv)
             die("unexpected argument: %s", argv[i]);
         }
     }
+    if (mono_flag && layout_flag_set)
+        die("--mono, --sbs and --tb are mutually exclusive");
     app.layout = layout_flag;
 
     // Mode checks.
@@ -1426,16 +1498,12 @@ int main(int argc, char **argv)
         die("--solid cannot be combined with --sbs or --tb");
     if ((have_hfov || have_vfov || have_zoom) && !app.vr)
         die("--hfov, --vfov and --zoom only apply with --vr");
-    if (app.vr && app.layout == Layout::None)
-        die("--vr needs a stereo layout: add --sbs or --tb "
-            "(mono VR video is not supported yet)");
     if (app.swap_eyes && app.layout == Layout::None)
-        fprintf(stderr, "mpv-vr: warning: --swap-eyes has no effect without "
-                        "--sbs or --tb\n");
+        fprintf(stderr, "mpv-vr: warning: --swap-eyes has no effect with --mono\n");
     if ((app.halign_deg != 0 || app.valign_deg != 0) &&
         app.layout == Layout::None)
         fprintf(stderr, "mpv-vr: warning: --halignment/--valignment have no "
-                        "effect without --sbs or --tb\n");
+                        "effect with --mono\n");
     if (app.solid && !app.mpv_opts.empty())
         fprintf(stderr, "mpv-vr: warning: --mpv options have no effect with "
                         "--solid (mpv is not used)\n");
