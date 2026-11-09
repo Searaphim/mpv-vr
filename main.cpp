@@ -80,6 +80,8 @@ const GLubyte *glGetStringi(GLenum name, GLuint index);
 #define KEY_ZOOM_STEP       0.05
 #define KEY_ALIGNMENT_STEP  0.1   // degrees per arrow-key press
 #define KEY_ASPECT_STEP     0.01  // per period/comma press
+#define KEY_VIEW_ROTATION_STEP 0.5 // degrees per W/A/S/D press in VR mode
+#define KEY_FLAT_MOVE_STEP  0.02  // metres per W/A/S/D press in flat mode
 
 // Swapchain sizing is measured at runtime (see create_swapchain): the headset's
 // pixel density from its reported field of view, the video's own resolution,
@@ -189,6 +191,11 @@ struct App {
     // --swap-eyes says about which half of the file goes where.
     double halign_deg = 0.0; // --halignment
     double valign_deg = 0.0; // --valignment
+    // View offset: rotations in VR, screen translation in flat mode.
+    double view_yaw_deg = 0.0;
+    double view_pitch_deg = 0.0;
+    double flat_offset_x = 0.0; // metres, positive = right
+    double flat_offset_y = 0.0; // metres, positive = up
     double hfov_deg = 180.0; // --hfov (VR only)
     double vfov_deg = 0.0;   // --vfov (VR only); 0 = derive from the picture
     // --zoom (VR only): enlarges (>1) or shrinks (<1) the picture by scaling
@@ -800,6 +807,38 @@ static void poll_keyboard(App &app)
         case ' ':
             toggle_pause(app);
             break;
+        case 'w':
+        case 'W':
+        case 's':
+        case 'S':
+        case 'a':
+        case 'A':
+        case 'd':
+        case 'D':
+            if (app.vr) {
+                // Positive pitch tilts the picture upward. A is a
+                // counter-clockwise yaw (negative Y); D is clockwise.
+                if (c == 'w' || c == 'W')
+                    app.view_pitch_deg = std::min(90.0, app.view_pitch_deg + KEY_VIEW_ROTATION_STEP);
+                else if (c == 's' || c == 'S')
+                    app.view_pitch_deg = std::max(-90.0, app.view_pitch_deg - KEY_VIEW_ROTATION_STEP);
+                else if (c == 'a' || c == 'A')
+                    app.view_yaw_deg = std::max(-180.0, app.view_yaw_deg - KEY_VIEW_ROTATION_STEP);
+                else
+                    app.view_yaw_deg = std::min(180.0, app.view_yaw_deg + KEY_VIEW_ROTATION_STEP);
+                fprintf(stderr, "mpv-vr: view rotation yaw=%.1f deg, pitch=%.1f deg\n",
+                        app.view_yaw_deg, app.view_pitch_deg);
+            } else {
+                if (c == 'w' || c == 'W') app.flat_offset_y += KEY_FLAT_MOVE_STEP;
+                else if (c == 's' || c == 'S') app.flat_offset_y -= KEY_FLAT_MOVE_STEP;
+                else if (c == 'a' || c == 'A') app.flat_offset_x -= KEY_FLAT_MOVE_STEP;
+                else app.flat_offset_x += KEY_FLAT_MOVE_STEP;
+                app.flat_offset_x = std::max(-2.0, std::min(2.0, app.flat_offset_x));
+                app.flat_offset_y = std::max(-2.0, std::min(2.0, app.flat_offset_y));
+                fprintf(stderr, "mpv-vr: flat view offset x=%.2f m, y=%.2f m\n",
+                        app.flat_offset_x, app.flat_offset_y);
+            }
+            break;
         case '+':
         case '=': // convenient on layouts where '+' requires Shift
         case '-':
@@ -1120,8 +1159,9 @@ static void frame_loop(App &app)
                 e.eyeVisibility = vis;
                 e.subImage = sub;
                 crop_sub_image(e.subImage, crop_x, crop_y);
-                e.pose.orientation =
-                    alignment_orientation(-shift_right_deg, shift_up_deg);
+                e.pose.orientation = alignment_orientation(
+                    app.view_yaw_deg - shift_right_deg,
+                    app.view_pitch_deg + shift_up_deg);
                 e.pose.position = { 0, 0, 0 };
                 e.radius = VR_SPHERE_RADIUS;
                 e.centralHorizontalAngle = (float)(show_h * M_PI / 180.0);
@@ -1138,8 +1178,8 @@ static void frame_loop(App &app)
                 // head (QUAD_Z is negative, hence the minus).
                 const double d2r = M_PI / 180.0;
                 q.pose.position = {
-                    (float)(-QUAD_Z * std::tan(shift_right_deg * d2r)),
-                    (float)(-QUAD_Z * std::tan(shift_up_deg * d2r)),
+                    (float)(app.flat_offset_x - QUAD_Z * std::tan(shift_right_deg * d2r)),
+                    (float)(app.flat_offset_y - QUAD_Z * std::tan(shift_up_deg * d2r)),
                     0.0f };
                 q.size = { QUAD_WIDTH, quad_h };
                 q.eyeVisibility = vis;
@@ -1293,6 +1333,8 @@ static void print_usage()
         "  up / down           vertical eye alignment +/- 0.1 deg\n"
         "  left / right        horizontal eye alignment +/- 0.1 deg\n"
         "  . / ,               per-eye aspect +/- 0.01\n"
+        "  W / S               VR: pitch up/down; flat: move screen up/down\n"
+        "  A / D               VR: yaw counter-clockwise/clockwise; flat: move screen left/right\n"
         "  v / f               switch to VR / flat mode\n");
 }
 
@@ -1680,7 +1722,7 @@ int main(int argc, char **argv)
         if (terminal_raw_enable())
             fprintf(stderr, "mpv-vr: keys (type in this terminal): "
                             "space=pause, numpad +/-=zoom, arrows=alignment, "
-                            "./,=aspect, V=VR, F=flat\n");
+                            "./,=aspect, W/A/S/D=view offset, V=VR, F=flat\n");
         else
             fprintf(stderr, "mpv-vr: stdin is not a foreground terminal, "
                             "keyboard controls disabled\n");
