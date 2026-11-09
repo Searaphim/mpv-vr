@@ -72,6 +72,12 @@ const GLubyte *glGetStringi(GLenum name, GLuint index);
 #ifndef GL_OUT_OF_MEMORY
 #define GL_OUT_OF_MEMORY 0x0505
 #endif
+#ifndef GL_RGBA16F
+#define GL_RGBA16F 0x881A
+#endif
+#ifndef GL_FRAMEBUFFER_SRGB
+#define GL_FRAMEBUFFER_SRGB 0x8DB9
+#endif
 
 #define QUAD_Z (-4.0f)      // flat screen sits this far in front of the head
 #define QUAD_WIDTH (2.0f)   // flat screen width in metres
@@ -147,9 +153,19 @@ struct App {
     XrSpace localSpace{};
     uint32_t viewCount = 0;
     uint32_t width = 0, height = 0; // swapchain size (BOTH eyes if packed)
-    // GL internal format of the swapchain textures (e.g. GL_RGBA8). Passed to
-    // mpv as the FBO's internal_format so it doesn't have to guess.
+    // GL internal format of the swapchain textures, chosen by
+    // choose_swapchain_format(). The format also tells the OpenXR runtime how
+    // to read the colours: sRGB-encoded for GL_SRGB8_ALPHA8, linear light for
+    // everything else.
     int64_t format = 0;
+    // What that means for mpv: true = mpv must output linear light (target-trc
+    // linear), false = mpv's normal gamma-encoded sRGB output is what the
+    // swapchain expects. mpv_fbo_format is the internal_format mpv is told.
+    bool mpv_linear = false;
+    int mpv_fbo_format = 0;
+    // The video's colour properties are logged once after it loads.
+    bool colour_logged = false;
+    int colour_log_tries = 0;
     // The runtime's recommended per-eye size (the floor for our own sizing).
     uint32_t rec_w = 0, rec_h = 0;
     std::vector<XrSwapchain> swapchains;
@@ -245,6 +261,77 @@ static bool runtime_has_extension(const char *name)
         if (std::strcmp(p.extensionName, name) == 0)
             return true;
     return false;
+}
+
+// Which swapchain format to use, and what mpv must output to match it.
+//
+// How colour data is read is part of the swapchain format (OpenXR spec,
+// xrCreateSwapchain): an API-specific sRGB format (GL_SRGB8_ALPHA8) means the
+// data is sRGB-encoded and the runtime converts it to linear when sampling.
+// ANY other format is read as linear light. The runtime composites in linear
+// light and encodes for the display itself. mpv's output is gamma-encoded sRGB
+// by default, so:
+//   GL_SRGB8_ALPHA8  store mpv's encoded output as it is (GL_FRAMEBUFFER_SRGB
+//                    stays off, see frame_loop). Best.
+//   GL_RGBA16F       linear light with no banding: mpv outputs linear.
+//   GL_RGBA8         linear light in 8 bits: correct colours, but banding in
+//                    dark areas. Last resort.
+// Gamma-encoded video in a plain GL_RGBA8 swapchain (what this used to do)
+// gets encoded a second time by the runtime and looks washed out.
+struct SwapchainFormat {
+    int64_t format = 0;
+    bool linear = false;     // mpv must output linear light
+    int mpv_fbo_format = 0;  // internal_format to report to mpv (0 = unknown)
+    const char *name = "none offered";
+};
+
+static SwapchainFormat choose_swapchain_format(const std::vector<int64_t> &offered)
+{
+    auto has = [&](int64_t f) {
+        return std::find(offered.begin(), offered.end(), f) != offered.end();
+    };
+    SwapchainFormat c;
+    if (has(GL_SRGB8_ALPHA8))
+        // mpv is told plain RGBA8: it writes the same 8-bit encoded values and
+        // has no reason to treat the target as hardware-encoded sRGB.
+        c = { GL_SRGB8_ALPHA8, false, GL_RGBA8, "GL_SRGB8_ALPHA8 (sRGB-encoded)" };
+    else if (has(GL_RGBA16F))
+        c = { GL_RGBA16F, true, GL_RGBA16F, "GL_RGBA16F (linear light)" };
+    else if (has(GL_RGBA8))
+        c = { GL_RGBA8, true, GL_RGBA8,
+              "GL_RGBA8 (linear light, 8-bit: expect banding in dark areas)" };
+    else if (!offered.empty())
+        c = { offered[0], true, 0, "unrecognised format, treated as linear light" };
+    return c;
+}
+
+// Log the video's colour properties once it has loaded. If colours still look
+// wrong after the swapchain is right, this says whether the source is HDR
+// (PQ/HLG), wide-gamut (BT.2020) or limited range, which mpv has to convert.
+static void log_video_colour(App &app)
+{
+    if (app.colour_logged || !app.mpv || app.colour_log_tries >= 120)
+        return;
+    app.colour_log_tries++;
+    char *prim = nullptr, *gamma = nullptr, *levels = nullptr;
+    const int e1 = mpv_get_property(app.mpv, "video-params/primaries",
+                                    MPV_FORMAT_STRING, &prim);
+    const int e2 = mpv_get_property(app.mpv, "video-params/gamma",
+                                    MPV_FORMAT_STRING, &gamma);
+    const int e3 = mpv_get_property(app.mpv, "video-params/colorlevels",
+                                    MPV_FORMAT_STRING, &levels);
+    if (e1 >= 0 && e2 >= 0) { // known once the first frame has been decoded
+        const bool hdr = gamma && (!std::strcmp(gamma, "pq") ||
+                                   !std::strcmp(gamma, "hlg"));
+        fprintf(stderr, "mpv-vr: video colour: primaries=%s transfer=%s "
+                        "range=%s%s\n", prim ? prim : "?", gamma ? gamma : "?",
+                (e3 >= 0 && levels) ? levels : "?",
+                hdr ? " (HDR source: mpv tone-maps it to SDR sRGB)" : "");
+        app.colour_logged = true;
+    }
+    mpv_free(prim);
+    mpv_free(gamma);
+    mpv_free(levels);
 }
 
 // Diagnostic: print mpv's playback state so we can tell "no video loaded"
@@ -1130,6 +1217,7 @@ static void frame_loop(App &app)
 
         // Learn the per-eye aspect from the video once it has loaded.
         update_eye_aspect(app);
+        log_video_colour(app);
 
         // VR with no explicit --vfov needs the aspect to know how tall the
         // sphere section is. Until the video size is known there is nothing
@@ -1200,13 +1288,20 @@ static void frame_loop(App &app)
                 uint64_t flags = mpv_render_context_update(app.render);
                 (void)flags; // MPV_RENDER_UPDATE_FRAME set = new video frame
 
+                // mpv writes already-encoded values (or linear light for a
+                // linear swapchain), and they must land in the texture as they
+                // are. With GL_FRAMEBUFFER_SRGB on, the hardware would encode
+                // them again on the way into an sRGB texture. It is off by
+                // default; make sure, because mpv or Monado may have touched it.
+                glDisable(GL_FRAMEBUFFER_SRGB);
+
                 mpv_opengl_fbo fbo = {
                     .fbo = (int)app.fbos[0][idx],
                     .w = (int)app.width,
                     .h = (int)app.height,
-                    // The real swapchain format, so mpv doesn't guess (a
-                    // wrong guess gives washed-out or too-dark colors).
-                    .internal_format = (int)app.format,
+                    // What the texture holds, as chosen by
+                    // choose_swapchain_format().
+                    .internal_format = app.mpv_fbo_format,
                 };
                 // OpenXR GL swapchain textures are top-down relative to mpv's
                 // default FBO orientation, so flip vertically.
@@ -1758,33 +1853,27 @@ int main(int argc, char **argv)
     fprintf(stderr, "mpv-vr: runtime recommends %ux%u per eye\n", app.rec_w,
             app.rec_h);
 
-    // Pick a swapchain format the runtime offers. Prefer plain GL_RGBA8:
-    // video pixels are already gamma-encoded, so we want them stored as-is
-    // rather than run through sRGB conversion. Fall back to whatever the
-    // runtime lists first (0 if it doesn't say).
+    // Pick a swapchain format from what the runtime offers. The format also
+    // decides how the runtime reads the colours, so it decides what mpv must
+    // output: see choose_swapchain_format().
     uint32_t nf = 0;
     xrEnumerateSwapchainFormats(app.session, 0, &nf, nullptr);
-    int64_t format = 0;
+    std::vector<int64_t> offered(nf);
     if (nf > 0) {
-        std::vector<int64_t> formats(nf);
-        xrEnumerateSwapchainFormats(app.session, nf, &nf, formats.data());
+        xrEnumerateSwapchainFormats(app.session, nf, &nf, offered.data());
+        offered.resize(nf);
         fprintf(stderr, "mpv-vr: runtime swapchain formats:");
-        for (auto f : formats)
+        for (auto f : offered)
             fprintf(stderr, " 0x%llx", (unsigned long long)f);
         fputc('\n', stderr);
-        format = formats[0];
-        for (auto f : formats) {
-            if (f == (int64_t)GL_RGBA8) {
-                format = f;
-                break;
-            }
-        }
     }
-    app.format = format;
-    fprintf(stderr, "mpv-vr: using swapchain format 0x%llx%s\n",
-            (unsigned long long)format,
-            format == (int64_t)GL_RGBA8 ? " (GL_RGBA8)"
-            : format == (int64_t)GL_SRGB8_ALPHA8 ? " (GL_SRGB8_ALPHA8)" : "");
+    const SwapchainFormat chosen = choose_swapchain_format(offered);
+    app.format = chosen.format;
+    app.mpv_linear = chosen.linear;
+    app.mpv_fbo_format = chosen.mpv_fbo_format;
+    fprintf(stderr, "mpv-vr: using swapchain format 0x%llx %s; mpv outputs %s\n",
+            (unsigned long long)chosen.format, chosen.name,
+            chosen.linear ? "linear light" : "sRGB-encoded colour");
 
     // The swapchain (one for everything: both eyes' pictures are packed into
     // it, or it is a single picture for plain 2D) is created from the frame
@@ -1837,6 +1926,13 @@ int main(int argc, char **argv)
         // screen's shape comes from the video (not the texture), so there
         // are no black bars baked into the picture.
         mpv_set_option_string(app.mpv, "keepaspect", "no");
+        // Colour: what mpv writes must match how the swapchain format is read
+        // by the OpenXR runtime (see choose_swapchain_format). sRGB-encoded
+        // for an sRGB swapchain, linear light for any other format.
+        if (mpv_set_option_string(app.mpv, "target-trc",
+                                  app.mpv_linear ? "linear" : "srgb") < 0)
+            fprintf(stderr, "mpv-vr: warning: this mpv rejected target-trc; "
+                            "colours may be wrong\n");
         // Hardware decoding on the NVIDIA GPU. nvdec = zero-copy via
         // CUDA-GL interop; nvdec-copy = same decoder, frames copied back to
         // system memory (more compatible, slower at 8K).
