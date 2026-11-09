@@ -58,7 +58,10 @@ const GLubyte *glGetStringi(GLenum name, GLuint index);
 #include <string>
 #include <utility>
 #include <vector>
+#include <csignal>
 #include <dlfcn.h>
+#include <termios.h>
+#include <unistd.h>
 
 #ifndef GL_SRGB8_ALPHA8
 #define GL_SRGB8_ALPHA8 0x8C43
@@ -72,6 +75,11 @@ const GLubyte *glGetStringi(GLenum name, GLuint index);
 
 #define QUAD_Z (-4.0f)      // flat screen sits this far in front of the head
 #define QUAD_WIDTH (2.0f)   // flat screen width in metres
+
+// Keyboard adjustment increments (easy to tune).
+#define KEY_ZOOM_STEP       0.05
+#define KEY_ALIGNMENT_STEP  0.1   // degrees per arrow-key press
+#define KEY_ASPECT_STEP     0.01  // per period/comma press
 
 // Swapchain sizing is measured at runtime (see create_swapchain): the headset's
 // pixel density from its reported field of view, the video's own resolution,
@@ -169,6 +177,7 @@ struct App {
     // --vr: equirect sphere section around the viewer. Otherwise (the
     // default) the video goes on a flat quad screen.
     bool vr = false;
+    bool vr_extension_enabled = false; // runtime supports equirect2 layers
     Layout layout = Layout::None; // --sbs / --tb
     Packing packing = Packing::Auto; // --sbs=half|full, --tb=half|full
     bool swap_eyes = false; // --swap-eyes
@@ -692,6 +701,155 @@ static XrQuaternionf alignment_orientation(double yaw_deg, double pitch_deg)
     return q;
 }
 
+// ---- Keyboard input from the terminal ----
+//
+// Keys are read from the terminal mpv-vr was started in (stdin), so THAT
+// terminal needs keyboard focus, not the headset. It is put in non-canonical,
+// no-echo mode with non-blocking reads (VMIN=0, VTIME=0), so checking it once
+// per frame never waits. ISIG stays on, so Ctrl-C still works. The original
+// settings are restored on every way out: normal exit, die() (which calls
+// exit), and SIGINT/SIGTERM/SIGHUP.
+static termios g_tty_saved;
+static volatile sig_atomic_t g_tty_raw = 0;
+
+static void terminal_restore()
+{
+    if (g_tty_raw) {
+        g_tty_raw = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_tty_saved);
+    }
+}
+
+static void terminal_signal(int sig)
+{
+    terminal_restore(); // tcsetattr, signal and raise are async-signal-safe
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// Returns false (and leaves the terminal alone) if stdin is not a terminal,
+// or not in the foreground (changing a background job's terminal would stop
+// the process).
+static bool terminal_raw_enable()
+{
+    if (!isatty(STDIN_FILENO) || tcgetpgrp(STDIN_FILENO) != getpgrp())
+        return false;
+    if (tcgetattr(STDIN_FILENO, &g_tty_saved) != 0)
+        return false;
+    termios t = g_tty_saved;
+    t.c_lflag &= ~(ICANON | ECHO);
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &t) != 0)
+        return false;
+    g_tty_raw = 1;
+    atexit(terminal_restore);
+    signal(SIGINT, terminal_signal);
+    signal(SIGTERM, terminal_signal);
+    signal(SIGHUP, terminal_signal);
+    return true;
+}
+
+static void toggle_pause(App &app)
+{
+    int paused = 0;
+    if (mpv_get_property(app.mpv, "pause", MPV_FORMAT_FLAG, &paused) < 0)
+        return;
+    paused = !paused;
+    mpv_set_property(app.mpv, "pause", MPV_FORMAT_FLAG, &paused);
+    fprintf(stderr, "mpv-vr: %s\n", paused ? "paused" : "resumed");
+}
+
+// Read whatever keys were typed since the last frame and act on them. Other
+// keys (and the bytes of escape sequences, e.g. arrow keys) are ignored.
+static void poll_keyboard(App &app)
+{
+    if (!g_tty_raw || !app.mpv)
+        return;
+
+    // Arrow keys arrive as ANSI escape sequences (ESC [ A/B/C/D), and a
+    // sequence can be split across consecutive frame polls.
+    static int escape_state = 0;
+    char buf[64];
+    const ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+    for (ssize_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)buf[i];
+        if (escape_state == 1) {
+            escape_state = (c == '[') ? 2 : 0;
+            continue;
+        }
+        if (escape_state == 2) {
+            escape_state = 0;
+            switch (c) {
+            case 'A': app.valign_deg = std::min(20.0, app.valign_deg + KEY_ALIGNMENT_STEP); break;
+            case 'B': app.valign_deg = std::max(-20.0, app.valign_deg - KEY_ALIGNMENT_STEP); break;
+            case 'C': app.halign_deg = std::min(20.0, app.halign_deg + KEY_ALIGNMENT_STEP); break;
+            case 'D': app.halign_deg = std::max(-20.0, app.halign_deg - KEY_ALIGNMENT_STEP); break;
+            default: break;
+            }
+            fprintf(stderr, "mpv-vr: alignment horizontal=%.2f deg, vertical=%.2f deg\n",
+                    app.halign_deg, app.valign_deg);
+            continue;
+        }
+        if (c == 0x1b) {
+            escape_state = 1;
+            continue;
+        }
+
+        switch (c) {
+        case ' ':
+            toggle_pause(app);
+            break;
+        case '+':
+        case '=': // convenient on layouts where '+' requires Shift
+        case '-':
+            app.zoom = std::max(0.1, std::min(10.0,
+                app.zoom + (c == '-' ? -KEY_ZOOM_STEP : KEY_ZOOM_STEP)));
+            fprintf(stderr, "mpv-vr: zoom=%.2f\n", app.zoom);
+            if (app.vr) {
+                destroy_swapchain(app);
+                app.vr_logged = false;
+            }
+            break;
+        case '.':
+        case ',':
+            update_eye_aspect(app);
+            if (app.eye_aspect > 0) {
+                app.eye_aspect = std::max(0.05, std::min(20.0,
+                    app.eye_aspect + (c == '.' ? KEY_ASPECT_STEP : -KEY_ASPECT_STEP)));
+                fprintf(stderr, "mpv-vr: per-eye aspect=%.3f\n", app.eye_aspect);
+            } else {
+                fprintf(stderr, "mpv-vr: aspect is not available until the video loads\n");
+            }
+            break;
+        case 'v':
+        case 'V':
+            if (!app.vr_extension_enabled) {
+                fprintf(stderr, "mpv-vr: VR mode unavailable: runtime lacks %s\n",
+                        XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
+            } else if (app.layout == Layout::None) {
+                fprintf(stderr, "mpv-vr: VR mode needs --sbs or --tb stereo layout\n");
+            } else if (!app.vr) {
+                app.vr = true;
+                app.vr_logged = false;
+                destroy_swapchain(app);
+                fprintf(stderr, "mpv-vr: switched to VR mode\n");
+            }
+            break;
+        case 'f':
+        case 'F':
+            if (app.vr) {
+                app.vr = false;
+                destroy_swapchain(app);
+                fprintf(stderr, "mpv-vr: switched to flat mode\n");
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static void end_frame_empty(App &app, XrTime displayTime)
 {
     XrFrameEndInfo fei = {};
@@ -717,6 +875,7 @@ static void frame_loop(App &app)
     int frame = 0;
     while (!app.quit) {
         poll_events(app);
+        poll_keyboard(app);
         if (app.quit)
             break;
 
@@ -1001,6 +1160,7 @@ static void frame_loop(App &app)
 
 static void shutdown(App &app)
 {
+    terminal_restore();
     if (app.render)
         mpv_render_context_free(app.render);
     if (app.mpv)
@@ -1125,7 +1285,15 @@ static void print_usage()
         "                      pass any mpv option; repeat for several, e.g.\n"
         "                      --mpv=scale=ewa_lanczos --mpv=\"sub-file=/my dir/a.srt\"\n"
         "                      (no value = yes, no-<name> = no). Applied after\n"
-        "                      mpv-vr's own settings; vo and keepaspect are fixed\n");
+        "                      mpv-vr's own settings; vo and keepaspect are fixed\n"
+        "\n"
+        "keys (type in the terminal mpv-vr runs in, not in the headset):\n"
+        "  space               pause / resume\n"
+        "  numpad + / -        zoom in / out (0.05 per press; VR mode)\n"
+        "  up / down           vertical eye alignment +/- 0.1 deg\n"
+        "  left / right        horizontal eye alignment +/- 0.1 deg\n"
+        "  . / ,               per-eye aspect +/- 0.01\n"
+        "  v / f               switch to VR / flat mode\n");
 }
 
 int main(int argc, char **argv)
@@ -1305,12 +1473,13 @@ int main(int argc, char **argv)
         XR_MNDX_EGL_ENABLE_EXTENSION_NAME,
         XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
     };
-    if (app.vr) {
-        if (!runtime_has_extension(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME))
-            die("the OpenXR runtime does not offer %s, which --vr needs",
-                XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
+    app.vr_extension_enabled =
+        runtime_has_extension(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
+    if (app.vr && !app.vr_extension_enabled)
+        die("the OpenXR runtime does not offer %s, which --vr needs",
+            XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
+    if (app.vr_extension_enabled)
         instance_exts.push_back(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
-    }
     XrInstanceCreateInfo ic = {};
     ic.type = XR_TYPE_INSTANCE_CREATE_INFO;
     ic.applicationInfo = appInfo;
@@ -1430,7 +1599,7 @@ int main(int argc, char **argv)
 
     // VR space: fixed in the world, origin where the headset started, so the
     // picture stays put when you turn your head.
-    if (app.vr) {
+    if (app.vr_extension_enabled) {
         XrReferenceSpaceCreateInfo ls = {};
         ls.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
         ls.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -1504,6 +1673,17 @@ int main(int argc, char **argv)
         const char *load[] = { "loadfile", video, "replace", nullptr };
         int e = mpv_command(app.mpv, load);
         fprintf(stderr, "mpv-vr: mpv loadfile('%s') -> %d\n", video, (int)e);
+    }
+
+    // Keyboard controls from the terminal (not in --solid, which has no mpv).
+    if (!app.solid) {
+        if (terminal_raw_enable())
+            fprintf(stderr, "mpv-vr: keys (type in this terminal): "
+                            "space=pause, numpad +/-=zoom, arrows=alignment, "
+                            "./,=aspect, V=VR, F=flat\n");
+        else
+            fprintf(stderr, "mpv-vr: stdin is not a foreground terminal, "
+                            "keyboard controls disabled\n");
     }
 
     frame_loop(app);
