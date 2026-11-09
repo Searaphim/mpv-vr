@@ -194,6 +194,13 @@ struct App {
     // View offset: rotations in VR, screen translation in flat mode.
     double view_yaw_deg = 0.0;
     double view_pitch_deg = 0.0;
+    // Recenter (R key, VR mode): yaw added to the picture so its centre faces
+    // where the head pointed when R was pressed. 0 = the playspace's own
+    // forward, i.e. whatever direction the runtime picked at launch.
+    double recenter_yaw_deg = 0.0;
+    // Set by the R key and handled in the frame loop, which knows the frame's
+    // display time (needed to ask where the head is pointing).
+    bool recenter_pending = false;
     double flat_offset_x = 0.0; // metres, positive = right
     double flat_offset_y = 0.0; // metres, positive = up
     double hfov_deg = 180.0; // --hfov (VR only)
@@ -601,42 +608,75 @@ static void create_swapchain(App &app, const std::vector<XrView> &views,
 //   TB,  full (unsqueezed) eye = frame * 2     (each eye gets half the height)
 //   TB,  half (squeezed)   eye = frame
 //
-// With Packing::Auto in flat mode we guess from the frame's shape. No normal
-// movie frame is wider than ~2.4 and no full-SBS frame is narrower than ~2.7,
-// so SBS wider than 3.0 is full. For TB a full-TB frame of a normal movie is
-// at most ~1.2 and a half-TB frame is at least ~1.33, so TB narrower than
-// 1.25 is full (a narrower margin than SBS: use =half/=full if it guesses
-// wrong). In VR mode Auto means full: VR video is not normally squeezed.
-static void update_eye_aspect(App &app)
+// The frame's display aspect ratio, from the loaded video. Returns false (and
+// leaves `frame` alone) until the video has loaded.
+static bool read_frame_aspect(App &app, int64_t &w, int64_t &h, double &frame)
 {
-    if (app.eye_aspect > 0 || !app.mpv)
-        return;
-    int64_t w = 0, h = 0;
-    if (mpv_get_property(app.mpv, "width", MPV_FORMAT_INT64, &w) < 0 ||
-        mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &h) < 0 ||
-        w <= 0 || h <= 0)
-        return; // video not loaded yet
-
+    int64_t vw = 0, vh = 0;
+    if (!app.mpv ||
+        mpv_get_property(app.mpv, "width", MPV_FORMAT_INT64, &vw) < 0 ||
+        mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &vh) < 0 ||
+        vw <= 0 || vh <= 0)
+        return false;
+    w = vw;
+    h = vh;
     // Prefer the display aspect (accounts for non-square pixels); fall back
     // to the plain pixel ratio.
-    double frame = (double)w / (double)h;
+    frame = (double)vw / (double)vh;
     double dar = 0;
     if (mpv_get_property(app.mpv, "video-params/aspect", MPV_FORMAT_DOUBLE,
                         &dar) >= 0 && dar > 0)
         frame = dar;
+    return true;
+}
+
+// What Packing::Auto means right now. This is the ONE place that decides it:
+// both the picture on screen (update_eye_aspect) and the L key (cycle_layout)
+// ask here, so they can't disagree about what is being displayed.
+//   VR:   full. VR video is not normally squeezed.
+//   flat: guessed from the frame's shape. No normal movie frame is wider than
+//         ~2.4 and no full-SBS frame is narrower than ~2.7, so SBS wider than
+//         3.0 is full. For TB a full-TB frame of a normal movie is at most
+//         ~1.2 and a half-TB frame is at least ~1.33, so TB narrower than 1.25
+//         is full (a narrower margin than SBS: use =half/=full if it guesses
+//         wrong).
+// An explicit =half / =full always wins.
+static Packing resolve_packing(const App &app, double frame)
+{
+    if (app.packing != Packing::Auto)
+        return app.packing;
+    if (app.vr)
+        return Packing::Full;
+    switch (app.layout) {
+    case Layout::SideBySide:
+        return frame > 3.0 ? Packing::Full : Packing::Half;
+    case Layout::TopBottom:
+        return frame < 1.25 ? Packing::Full : Packing::Half;
+    case Layout::None:
+        break;
+    }
+    return Packing::Full; // a single picture has no packing; value unused
+}
+
+static void update_eye_aspect(App &app)
+{
+    if (app.eye_aspect > 0)
+        return;
+    int64_t w = 0, h = 0;
+    double frame = 0;
+    if (!read_frame_aspect(app, w, h, frame))
+        return; // video not loaded yet
 
     const char *what = "single picture";
     bool full = false;
     switch (app.layout) {
     case Layout::SideBySide:
-        full = app.packing == Packing::Full ||
-               (app.packing == Packing::Auto && (app.vr || frame > 3.0));
+        full = resolve_packing(app, frame) == Packing::Full;
         app.eye_aspect = full ? frame / 2.0 : frame;
         what = full ? "full SBS" : "half SBS";
         break;
     case Layout::TopBottom:
-        full = app.packing == Packing::Full ||
-               (app.packing == Packing::Auto && (app.vr || frame < 1.25));
+        full = resolve_packing(app, frame) == Packing::Full;
         app.eye_aspect = full ? frame * 2.0 : frame;
         what = full ? "full TB" : "half TB";
         break;
@@ -709,6 +749,51 @@ static XrQuaternionf alignment_orientation(double yaw_deg, double pitch_deg)
     return q;
 }
 
+// Heading of an orientation about the vertical axis, in degrees: 0 = facing the
+// space's -Z, positive = turned to the left. That is the same sign convention
+// as the yaw in alignment_orientation(), so the result can be fed straight back
+// into it. Pitch and roll are ignored, so tilting the head doesn't matter.
+// Returns false when the forward direction is within ~12 degrees of straight
+// up or down, where a heading isn't meaningful.
+static bool yaw_from_orientation(const XrQuaternionf &q, double &yaw_deg)
+{
+    // Horizontal components of the forward direction q * (0, 0, -1).
+    const double fx = -2.0 * (q.w * q.y + q.z * q.x);
+    const double fz = -1.0 + 2.0 * (q.x * q.x + q.y * q.y);
+    if (std::hypot(fx, fz) < 0.2)
+        return false;
+    yaw_deg = std::atan2(-fx, -fz) * 180.0 / M_PI;
+    return true;
+}
+
+// R key, VR mode: turn the picture so its centre faces where the head is
+// pointing now. Only the heading (yaw) is taken, so the horizon stays level. The
+// W/A/S/D view offsets are cleared too, since they were just a manual way of
+// doing this and would otherwise shift the new centre.
+static void recenter_view(App &app, XrTime time)
+{
+    // The view space is the head pose plus a pure translation (QUAD_Z), so its
+    // orientation in the local space is the head's orientation.
+    XrSpaceLocation loc = {};
+    loc.type = XR_TYPE_SPACE_LOCATION;
+    if (xrLocateSpace(app.viewSpace, app.localSpace, time, &loc) != XR_SUCCESS ||
+        !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+        fprintf(stderr, "mpv-vr: recenter: no head pose yet, press R again\n");
+        return;
+    }
+    double yaw = 0.0;
+    if (!yaw_from_orientation(loc.pose.orientation, yaw)) {
+        fprintf(stderr, "mpv-vr: recenter: you are looking almost straight up "
+                        "or down; look toward the horizon and press R again\n");
+        return;
+    }
+    app.recenter_yaw_deg = yaw;
+    app.view_yaw_deg = 0.0;
+    app.view_pitch_deg = 0.0;
+    fprintf(stderr, "mpv-vr: view recentered (heading %.1f deg from the launch "
+                    "direction)\n", yaw);
+}
+
 // ---- Keyboard input from the terminal ----
 //
 // Keys are read from the terminal mpv-vr was started in (stdin), so THAT
@@ -768,42 +853,34 @@ static void toggle_pause(App &app)
     fprintf(stderr, "mpv-vr: %s\n", paused ? "paused" : "resumed");
 }
 
+// Switch between flat and VR. Packing::Auto means something different in each
+// (see resolve_packing), so unless the per-eye aspect was set explicitly it has
+// to be worked out again for the new mode. Without this the screen keeps the
+// other mode's reading of the file, and the next L press steps from a state
+// that isn't the one on screen.
+static void set_vr_mode(App &app, bool vr)
+{
+    app.vr = vr;
+    if (!app.eye_aspect_explicit)
+        app.eye_aspect = 0.0;
+    app.vr_logged = false;
+    destroy_swapchain(app);
+    fprintf(stderr, "mpv-vr: switched to %s mode\n", vr ? "VR" : "flat");
+}
+
 // Cycle through all display packing modes in this order:
 // mono -> SBS half -> SBS full -> TB half -> TB full -> mono.
-// Resolve Packing::Auto using the same frame-shape heuristic as
-// update_eye_aspect(), so the first key press advances from what is actually
-// being displayed rather than from an assumed default.
+// The first press steps from what is actually on screen: Packing::Auto is
+// resolved by the same resolve_packing() that update_eye_aspect() uses.
 static void cycle_layout(App &app)
 {
-    auto effective_packing = [&]() {
-        if (app.layout == Layout::None || app.packing != Packing::Auto)
-            return app.packing;
-
-        // VR Auto is always full packing. In flat mode, use the same
-        // aspect-ratio thresholds as update_eye_aspect().
-        if (app.vr)
-            return Packing::Full;
-
-        int64_t w = 0, h = 0;
-        if (!app.mpv ||
-            mpv_get_property(app.mpv, "width", MPV_FORMAT_INT64, &w) < 0 ||
-            mpv_get_property(app.mpv, "height", MPV_FORMAT_INT64, &h) < 0 ||
-            w <= 0 || h <= 0)
-            return Packing::Half; // sensible fallback before video metadata
-
-        double frame = (double)w / (double)h;
-        double dar = 0;
-        if (mpv_get_property(app.mpv, "video-params/aspect",
-                             MPV_FORMAT_DOUBLE, &dar) >= 0 && dar > 0)
-            frame = dar;
-
-        const bool full = app.layout == Layout::SideBySide
-                              ? frame > 3.0
-                              : frame < 1.25;
-        return full ? Packing::Full : Packing::Half;
-    };
-
-    const Packing current = effective_packing();
+    // Before the video has loaded there is no frame shape yet; 16:9 resolves to
+    // half in flat mode (and Auto is always full in VR), which is the same
+    // reading update_eye_aspect() would give a normal frame.
+    int64_t w = 0, h = 0;
+    double frame = 16.0 / 9.0;
+    read_frame_aspect(app, w, h, frame);
+    const Packing current = resolve_packing(app, frame);
     const char *name = nullptr;
     if (app.layout == Layout::None) {
         app.layout = Layout::SideBySide;
@@ -933,16 +1010,20 @@ static void poll_keyboard(App &app)
                 fprintf(stderr, "mpv-vr: VR mode unavailable: runtime lacks %s\n",
                         XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
             } else {
-                app.vr = !app.vr;
-                app.vr_logged = false;
-                destroy_swapchain(app);
-                fprintf(stderr, "mpv-vr: switched to %s mode\n",
-                        app.vr ? "VR" : "flat");
+                set_vr_mode(app, !app.vr);
             }
             break;
         case 'l':
         case 'L':
             cycle_layout(app);
+            break;
+        case 'r':
+        case 'R':
+            if (app.vr)
+                app.recenter_pending = true; // handled in the frame loop
+            else
+                fprintf(stderr, "mpv-vr: R only applies in VR mode (the flat "
+                                "screen is head-locked)\n");
             break;
         default:
             break;
@@ -1037,6 +1118,14 @@ static void frame_loop(App &app)
             app.skipped++;
             end_frame_empty(app, fs.predictedDisplayTime);
             continue;
+        }
+
+        // R key: recenter now that there is a valid head pose. (If the pose was
+        // invalid we never get here, so the request simply waits.)
+        if (app.recenter_pending) {
+            app.recenter_pending = false;
+            if (app.vr)
+                recenter_view(app, fs.predictedDisplayTime);
         }
 
         // Learn the per-eye aspect from the video once it has loaded.
@@ -1221,7 +1310,7 @@ static void frame_loop(App &app)
                 e.subImage = sub;
                 crop_sub_image(e.subImage, crop_x, crop_y);
                 e.pose.orientation = alignment_orientation(
-                    app.view_yaw_deg - shift_right_deg,
+                    app.recenter_yaw_deg + app.view_yaw_deg - shift_right_deg,
                     app.view_pitch_deg + shift_up_deg);
                 e.pose.position = { 0, 0, 0 };
                 e.radius = VR_SPHERE_RADIUS;
@@ -1398,6 +1487,9 @@ static void print_usage()
         "  W / S               VR: pitch up/down; flat: move screen up/down\n"
         "  A / D               VR: yaw counter-clockwise/clockwise; flat: move screen left/right\n"
         "  V                   toggle VR / flat mode\n"
+        "  R                   VR: recenter the picture on where you are looking\n"
+        "                      now (heading only, horizon stays level; clears the\n"
+        "                      W/A/S/D view offsets)\n"
         "  L                   cycle layout: mono -> SBS half -> SBS full\n"
         "                      -> TB half -> TB full -> mono\n");
 }
